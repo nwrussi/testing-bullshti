@@ -74,7 +74,6 @@ def index():
 # Database
 # ---------------------------------------------------------------------------
 def get_db():
-    """Return a per-request SQLite connection stored in Flask's g object."""
     if "db" not in g:
         g.db = sqlite3.connect(DB_PATH, check_same_thread=False)
         g.db.row_factory = sqlite3.Row
@@ -82,16 +81,13 @@ def get_db():
         g.db.execute("PRAGMA synchronous=NORMAL")
     return g.db
 
-
 @app.teardown_appcontext
 def close_db(exc):
     db = g.pop("db", None)
     if db is not None:
         db.close()
 
-
 def init_db():
-    """Create tables and indexes. Safe to call on every startup."""
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript("""
@@ -115,14 +111,10 @@ def init_db():
             max_risk_score INTEGER NOT NULL DEFAULT 0
         );
 
-        CREATE INDEX IF NOT EXISTS idx_events_client_id
-            ON events(client_id);
-        CREATE INDEX IF NOT EXISTS idx_events_risk_level
-            ON events(risk_level);
-        CREATE INDEX IF NOT EXISTS idx_events_timestamp
-            ON events(timestamp DESC);
-        CREATE INDEX IF NOT EXISTS idx_events_composite
-            ON events(client_id, timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_events_client_id ON events(client_id);
+        CREATE INDEX IF NOT EXISTS idx_events_risk_level ON events(risk_level);
+        CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_events_composite ON events(client_id, timestamp DESC);
     """)
     conn.commit()
     conn.close()
@@ -132,42 +124,29 @@ def init_db():
 # Risk Scorer
 # ---------------------------------------------------------------------------
 class RiskScorer:
-    # Process name → base score
     PROCESS_SCORES = {
-        # Tier 1: Purely Malicious / Exploit Frameworks
         "mimikatz": 100, "cobaltstrike": 100, "msfconsole": 100, "bloodhound": 100,
         "rubeus": 100, "sharphound": 100, 
-        
-        # Tier 2: Dual-Use Admin/Net Tools (Suspicious for normal users, normal for IT)
         "psexec": 50, "wireshark": 50, "nmap": 50, "procdump": 50, 
         "tor.exe": 50, "angryip": 40, "putty": 30, "filezilla": 30,
-        
-        # Tier 3: LoLBins (Living off the Land) - Extremely common, low base score
         "powershell": 20, "cmd.exe": 20, "certutil": 20, "wscript": 20, "cscript": 20
     }
 
-    # Clipboard keyword → base score
     CLIP_KEYWORD_SCORES = {
         "-----begin": 40, "private key": 40, "aws_access_key": 40, 
         "api_key": 30, "ssn": 20, "password": 15, "secret": 15, "bearer": 15
     }
 
-    # In-memory tracker for kill-chain compounding
     _history = defaultdict(list)
-    TIME_WINDOW_SEC = 300  # 5 minutes
+    TIME_WINDOW_SEC = 300 
 
     @staticmethod
     def get_tactic(event_type: str, data: dict) -> str:
-        """Map event types to Kill-Chain tactics."""
         et = event_type.upper()
-        if et == "PROCESS":
-            return "EXECUTION"
-        elif et == "WINDOW":
-            return "RECON"
-        elif et == "CLIPBOARD":
-            return "COLLECTION"
-        elif et in ("USB_INSERT", "NETWORK_UPLOAD"):
-            return "EXFILTRATION"
+        if et == "PROCESS": return "EXECUTION"
+        elif et == "WINDOW": return "RECON"
+        elif et == "CLIPBOARD": return "COLLECTION"
+        elif et in ("USB_INSERT", "NETWORK_UPLOAD"): return "EXFILTRATION"
         return "OTHER"
 
     @classmethod
@@ -175,70 +154,46 @@ class RiskScorer:
         base = 0
         et = event_type.upper()
 
-        # 1. Calculate Base Score
         if et == "PROCESS":
             name = data.get("name", "").lower()
             for keyword, s in cls.PROCESS_SCORES.items():
-                if keyword in name:
-                    base = max(base, s)
-            if base == 0: base = 0 
-            
+                if keyword in name: base = max(base, s)
         elif et == "CLIPBOARD":
             keyword = data.get("keyword", "").lower()
             for kw, s in cls.CLIP_KEYWORD_SCORES.items():
-                if kw in keyword:
-                    base = max(base, s)
+                if kw in keyword: base = max(base, s)
             if base == 0: base = 10
-            
-        elif et == "USB_INSERT":
-            base = 25 
-            
-        elif et == "USB_REMOVE":
-            base = 10
-            
+        elif et == "USB_INSERT": base = 25 
+        elif et == "USB_REMOVE": base = 10
         elif et == "NETWORK_UPLOAD":
             bytes_out = data.get("bytes_out", 0)
-            if bytes_out >= 500 * 1024 * 1024:
-                base = 70
-            elif bytes_out >= 100 * 1024 * 1024:
-                base = 45
-            elif bytes_out >= 50 * 1024 * 1024:
-                base = 30
-            else:
-                base = 10
-
-        elif et == "AFTERHOURS":
-            base = 10 
+            if bytes_out >= 500 * 1024 * 1024: base = 70
+            elif bytes_out >= 100 * 1024 * 1024: base = 45
+            elif bytes_out >= 50 * 1024 * 1024: base = 30
+            else: base = 10
+        elif et == "AFTERHOURS": base = 10 
 
         if after_hours and base > 0:
             base = min(100, base + 10)
 
-        # 2. Kill-Chain Compounding Logic
         now = time.time()
         tactic = cls.get_tactic(et, data)
         
         cls._history[client_id] = [e for e in cls._history[client_id] if now - e['ts'] <= cls.TIME_WINDOW_SEC]
-        
         if tactic != "OTHER" and base > 0:
             cls._history[client_id].append({'ts': now, 'tactic': tactic, 'score': base})
 
         unique_tactics = set(e['tactic'] for e in cls._history[client_id])
         
         multiplier = 1.0
-        if len(unique_tactics) == 2:
-            multiplier = 1.5
-        elif len(unique_tactics) >= 3:
-            multiplier = 2.0
+        if len(unique_tactics) == 2: multiplier = 1.5
+        elif len(unique_tactics) >= 3: multiplier = 2.0
         
         final_score = min(100, int(base * multiplier))
 
-        # 3. Bucket into levels
-        if final_score >= 80:
-            level = "HIGH"
-        elif final_score >= 50:
-            level = "MED"
-        else:
-            level = "LOW"
+        if final_score >= 80: level = "HIGH"
+        elif final_score >= 50: level = "MED"
+        else: level = "LOW"
 
         return final_score, level
 
@@ -249,9 +204,7 @@ class RiskScorer:
 _alert_cache: dict[tuple, float] = {}
 _cache_lock = threading.Lock()
 
-
 def _should_alert(client_id: str, event_type: str) -> bool:
-    """Returns True if we should fire an alert (dedup by client+type, 5min window)."""
     key = (client_id, event_type)
     now = time.monotonic()
     with _cache_lock:
@@ -261,27 +214,17 @@ def _should_alert(client_id: str, event_type: str) -> bool:
             return True
     return False
 
-
 def _send_webhook(payload: dict):
-    if not WEBHOOK_URL:
-        return
+    if not WEBHOOK_URL: return
     try:
         data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            WEBHOOK_URL,
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            _ = resp.read()
+        req = urllib.request.Request(WEBHOOK_URL, data=data, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp: _ = resp.read()
     except Exception as exc:
         app.logger.warning("Webhook failed: %s", exc)
 
-
 def _send_email(subject: str, body: str):
-    if not SMTP_HOST or not SMTP_TO:
-        return
+    if not SMTP_HOST or not SMTP_TO: return
     try:
         msg = f"Subject: {subject}\nFrom: {SMTP_USER}\nTo: {SMTP_TO}\n\n{body}"
         if SMTP_PORT == 465:
@@ -298,22 +241,14 @@ def _send_email(subject: str, body: str):
     except Exception as exc:
         app.logger.warning("Email failed: %s", exc)
 
-
 def _dispatch_alert(event_row: dict, score: int):
-    """Fire webhook and email alert in a background thread."""
     payload = {
-        "alert": "HIGH_RISK_EVENT",
-        "score": score,
-        "hostname": event_row.get("hostname"),
-        "client_id": event_row.get("client_id"),
-        "event_type": event_row.get("event_type"),
-        "timestamp": event_row.get("timestamp"),
+        "alert": "HIGH_RISK_EVENT", "score": score,
+        "hostname": event_row.get("hostname"), "client_id": event_row.get("client_id"),
+        "event_type": event_row.get("event_type"), "timestamp": event_row.get("timestamp"),
         "data": event_row.get("data_json"),
     }
-    subject = (
-        f"[ALERT] {event_row.get('event_type')} on {event_row.get('hostname')} "
-        f"— risk score {score}"
-    )
+    subject = f"[ALERT] {event_row.get('event_type')} on {event_row.get('hostname')} — risk score {score}"
     body = json.dumps(payload, indent=2)
     t = threading.Thread(target=lambda: (_send_webhook(payload), _send_email(subject, body)), daemon=True)
     t.start()
@@ -326,7 +261,6 @@ def _make_client_id(hostname: str, ip: str) -> str:
     raw = f"{hostname.lower()}:{ip}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
-
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -336,21 +270,16 @@ def _utc_now() -> str:
 # ---------------------------------------------------------------------------
 @app.before_request
 def auth_check():
-    if request.method == "OPTIONS":
-        return
-
+    if request.method == "OPTIONS": return
     path = request.path
-
     if path.startswith("/api/admin/"):
-        if path == "/api/admin/login":
-            return
+        if path == "/api/admin/login": return
         token = request.headers.get("X-Admin-Token", "")
         with _admin_lock:
             if not token or token not in _admin_tokens:
                 return jsonify({"error": "Admin unauthorized"}), 401
         return
-
-    if request.method == "POST" and path.startswith("/api/"):
+    if request.method == "POST" and path.startswith("/api/") and path not in ["/api/archive"]:
         key = request.headers.get("X-Agent-Key", "")
         if key != PSK_SECRET:
             return jsonify({"error": "Unauthorized"}), 401
@@ -359,86 +288,85 @@ def auth_check():
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
-@app.route("/api/report", methods=["POST"])
-def report():
+@app.route("/api/archive", methods=["POST"])
+def archive_events():
+    """Saves a JSON payload of events directly to an 'archives' folder in the project."""
     try:
         body = request.get_json(force=True, silent=True)
     except Exception:
         return jsonify({"error": "Invalid JSON"}), 400
 
-    if not body or "events" not in body:
-        return jsonify({"error": "Missing events field"}), 400
+    events = body.get("events", [])
+    if not events:
+        return jsonify({"error": "No events provided"}), 400
+
+    os.makedirs("archives", exist_ok=True)
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    filename = f"archives/threat_events_{today_str}.json"
+    
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(events, f, indent=2)
+        
+    app.logger.info(f"Successfully archived {len(events)} events to {filename}")
+    return jsonify({"status": "ok", "filename": filename}), 200
+
+@app.route("/api/report", methods=["POST"])
+def report():
+    try: body = request.get_json(force=True, silent=True)
+    except Exception: return jsonify({"error": "Invalid JSON"}), 400
+    if not body or "events" not in body: return jsonify({"error": "Missing events field"}), 400
 
     hostname = body.get("hostname", "unknown")
     client_ip = request.remote_addr or "0.0.0.0"
     client_id = _make_client_id(hostname, client_ip)
     events = body.get("events", [])
 
-    if not isinstance(events, list):
-        return jsonify({"error": "events must be an array"}), 400
+    if not isinstance(events, list): return jsonify({"error": "events must be an array"}), 400
 
     db = get_db()
     inserted = 0
     max_score_this_batch = 0
 
     for ev in events:
-        if not isinstance(ev, dict):
-            continue
+        if not isinstance(ev, dict): continue
 
         event_type = str(ev.get("event_type", "UNKNOWN")).upper()
         data_json_raw = ev.get("data_json", "{}")
         timestamp = ev.get("timestamp") or _utc_now()
         after_hours = bool(ev.get("after_hours", False))
 
-        try:
-            data_dict = json.loads(data_json_raw) if isinstance(data_json_raw, str) else data_json_raw
-        except (json.JSONDecodeError, TypeError):
-            data_dict = {}
+        try: data_dict = json.loads(data_json_raw) if isinstance(data_json_raw, str) else data_json_raw
+        except (json.JSONDecodeError, TypeError): data_dict = {}
 
-        if isinstance(data_json_raw, dict):
-            data_json_str = json.dumps(data_json_raw)
-        else:
-            data_json_str = data_json_raw
+        if isinstance(data_json_raw, dict): data_json_str = json.dumps(data_json_raw)
+        else: data_json_str = data_json_raw
 
-        # Pass client_id to the scorer for state tracking
         score, level = RiskScorer.score(client_id, event_type, data_dict, after_hours)
         max_score_this_batch = max(max_score_this_batch, score)
 
         db.execute(
-            """INSERT INTO events
-               (timestamp, client_id, hostname, event_type, data_json, risk_score, risk_level)
+            """INSERT INTO events (timestamp, client_id, hostname, event_type, data_json, risk_score, risk_level)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (timestamp, client_id, hostname, event_type, data_json_str, score, level),
         )
 
         if score >= get_alert_threshold() and _should_alert(client_id, event_type):
-            _dispatch_alert(
-                {
-                    "hostname": hostname,
-                    "client_id": client_id,
-                    "event_type": event_type,
-                    "timestamp": timestamp,
-                    "data_json": data_json_str,
-                },
-                score,
-            )
-
+            _dispatch_alert({
+                "hostname": hostname, "client_id": client_id, "event_type": event_type,
+                "timestamp": timestamp, "data_json": data_json_str,
+            }, score)
         inserted += 1
 
     db.execute(
         """INSERT INTO clients (client_id, hostname, ip, last_seen, max_risk_score)
            VALUES (?, ?, ?, ?, ?)
            ON CONFLICT(client_id) DO UPDATE SET
-               hostname=excluded.hostname,
-               ip=excluded.ip,
-               last_seen=excluded.last_seen,
+               hostname=excluded.hostname, ip=excluded.ip, last_seen=excluded.last_seen,
                max_risk_score=MAX(clients.max_risk_score, excluded.max_risk_score)""",
         (client_id, hostname, client_ip, _utc_now(), max_score_this_batch),
     )
-
     db.commit()
     return jsonify({"status": "ok", "inserted": inserted}), 200
-
 
 @app.route("/api/events", methods=["GET"])
 def get_events():
@@ -464,20 +392,15 @@ def get_events():
     rows = db.execute(query, params).fetchall()
     return jsonify([dict(r) for r in rows])
 
-
 @app.route("/api/clients", methods=["GET"])
 def get_clients():
     db = get_db()
-    rows = db.execute(
-        "SELECT * FROM clients ORDER BY max_risk_score DESC"
-    ).fetchall()
+    rows = db.execute("SELECT * FROM clients ORDER BY max_risk_score DESC").fetchall()
     return jsonify([dict(r) for r in rows])
-
 
 @app.route("/api/stats", methods=["GET"])
 def get_stats():
     db = get_db()
-
     total = db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
     high  = db.execute("SELECT COUNT(*) FROM events WHERE risk_level='HIGH'").fetchone()[0]
     med   = db.execute("SELECT COUNT(*) FROM events WHERE risk_level='MED'").fetchone()[0]
@@ -485,23 +408,13 @@ def get_stats():
 
     cutoff = datetime.now(timezone.utc).timestamp() - ACTIVE_CLIENT_WINDOW
     cutoff_str = datetime.fromtimestamp(cutoff, tz=timezone.utc).isoformat()
-    active = db.execute(
-        "SELECT COUNT(*) FROM clients WHERE last_seen >= ?", (cutoff_str,)
-    ).fetchone()[0]
+    active = db.execute("SELECT COUNT(*) FROM clients WHERE last_seen >= ?", (cutoff_str,)).fetchone()[0]
 
-    return jsonify({
-        "total": total,
-        "high": high,
-        "med": med,
-        "low": low,
-        "active_clients": active,
-    })
-
+    return jsonify({"total": total, "high": high, "med": med, "low": low, "active_clients": active})
 
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "timestamp": _utc_now()})
-
 
 # ---------------------------------------------------------------------------
 # Admin endpoints
@@ -510,39 +423,30 @@ def health():
 def admin_login():
     body = request.get_json(force=True, silent=True) or {}
     password = body.get("password", "")
-    if password != ADMIN_PASSWORD:
-        return jsonify({"error": "Invalid password"}), 401
+    if password != ADMIN_PASSWORD: return jsonify({"error": "Invalid password"}), 401
     token = secrets.token_urlsafe(24)
-    with _admin_lock:
-        _admin_tokens.add(token)
+    with _admin_lock: _admin_tokens.add(token)
     return jsonify({"token": token})
-
 
 @app.route("/api/admin/logout", methods=["POST"])
 def admin_logout():
     token = request.headers.get("X-Admin-Token", "")
-    with _admin_lock:
-        _admin_tokens.discard(token)
+    with _admin_lock: _admin_tokens.discard(token)
     return jsonify({"status": "ok"})
-
 
 @app.route("/api/admin/check", methods=["GET"])
 def admin_check():
     return jsonify({"status": "ok"})
 
-
 @app.route("/api/admin/events", methods=["DELETE"])
 def admin_delete_events():
     client_id = request.args.get("client_id", "")
     db = get_db()
-    if client_id:
-        cur = db.execute("DELETE FROM events WHERE client_id = ?", (client_id,))
-    else:
-        cur = db.execute("DELETE FROM events")
+    if client_id: cur = db.execute("DELETE FROM events WHERE client_id = ?", (client_id,))
+    else: cur = db.execute("DELETE FROM events")
     deleted = cur.rowcount
     db.commit()
     return jsonify({"deleted": deleted})
-
 
 @app.route("/api/admin/clients/<client_id>", methods=["DELETE"])
 def admin_delete_client(client_id):
@@ -553,34 +457,23 @@ def admin_delete_client(client_id):
     db.commit()
     return jsonify({"deleted": deleted})
 
-
 @app.route("/api/admin/config", methods=["GET", "PUT"])
 def admin_config():
-    if request.method == "GET":
-        return jsonify({"alert_threshold": get_alert_threshold()})
-
+    if request.method == "GET": return jsonify({"alert_threshold": get_alert_threshold()})
     body = request.get_json(force=True, silent=True) or {}
     threshold = body.get("alert_threshold")
-    try:
-        threshold = int(threshold)
-    except (TypeError, ValueError):
-        return jsonify({"error": "alert_threshold must be an integer"}), 400
-    if threshold < 0 or threshold > 100:
-        return jsonify({"error": "alert_threshold must be between 0 and 100"}), 400
-    with _config_lock:
-        _runtime_config["alert_threshold"] = threshold
+    try: threshold = int(threshold)
+    except (TypeError, ValueError): return jsonify({"error": "alert_threshold must be an integer"}), 400
+    if threshold < 0 or threshold > 100: return jsonify({"error": "alert_threshold must be between 0 and 100"}), 400
+    with _config_lock: _runtime_config["alert_threshold"] = threshold
     return jsonify({"alert_threshold": threshold})
-
 
 @app.route("/api/admin/vacuum", methods=["POST"])
 def admin_vacuum():
     conn = sqlite3.connect(DB_PATH, isolation_level=None)
-    try:
-        conn.execute("VACUUM")
-    finally:
-        conn.close()
+    try: conn.execute("VACUUM")
+    finally: conn.close()
     return jsonify({"status": "ok"})
-
 
 @app.route("/api/admin/export", methods=["GET"])
 def admin_export():
@@ -588,40 +481,22 @@ def admin_export():
     db = get_db()
     rows = db.execute("SELECT * FROM events ORDER BY id DESC").fetchall()
     data = [dict(r) for r in rows]
-
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     if fmt == "csv":
         buf = io.StringIO()
-        fieldnames = ["id", "timestamp", "client_id", "hostname",
-                      "event_type", "risk_score", "risk_level", "data_json"]
+        fieldnames = ["id", "timestamp", "client_id", "hostname", "event_type", "risk_score", "risk_level", "data_json"]
         writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(data)
-        return Response(
-            buf.getvalue(),
-            mimetype="text/csv",
-            headers={"Content-Disposition":
-                     f"attachment; filename=events_full_{today}.csv"},
-        )
+        return Response(buf.getvalue(), mimetype="text/csv", headers={"Content-Disposition": f"attachment; filename=events_full_{today}.csv"})
 
-    return Response(
-        json.dumps(data, indent=2),
-        mimetype="application/json",
-        headers={"Content-Disposition":
-                 f"attachment; filename=events_full_{today}.json"},
-    )
+    return Response(json.dumps(data, indent=2), mimetype="application/json", headers={"Content-Disposition": f"attachment; filename=events_full_{today}.json"})
 
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     init_db()
     print(f"[*] InsiderThreat backend starting")
     print(f"[*] DB: {DB_PATH}")
     print(f"[*] Alert threshold: {ALERT_THRESHOLD}")
     print(f"[*] Admin password: {'default (admin)' if ADMIN_PASSWORD == 'admin' else 'custom'}")
-    print(f"[*] Webhook: {WEBHOOK_URL or 'disabled'}")
-    print(f"[*] Email: {'enabled' if SMTP_HOST and SMTP_TO else 'disabled'}")
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
