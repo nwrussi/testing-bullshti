@@ -15,8 +15,11 @@ Environment variables:
 """
 
 import os
+import io
+import csv
 import json
 import time
+import secrets
 import hashlib
 import sqlite3
 import threading
@@ -25,7 +28,7 @@ import ssl
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
-from flask import Flask, request, jsonify, g, send_from_directory
+from flask import Flask, request, jsonify, g, send_from_directory, Response
 from flask_cors import CORS
 
 # ---------------------------------------------------------------------------
@@ -34,6 +37,7 @@ from flask_cors import CORS
 PSK_SECRET      = os.environ.get("PSK_SECRET", "changeme")
 DB_PATH         = os.environ.get("DB_PATH", "events.db")
 ALERT_THRESHOLD = int(os.environ.get("ALERT_THRESHOLD", "80"))
+ADMIN_PASSWORD  = os.environ.get("ADMIN_PASSWORD", "admin")
 WEBHOOK_URL     = os.environ.get("WEBHOOK_URL", "")
 SMTP_HOST       = os.environ.get("SMTP_HOST", "")
 SMTP_PORT       = int(os.environ.get("SMTP_PORT", "465"))
@@ -43,6 +47,19 @@ SMTP_TO         = os.environ.get("SMTP_TO", "")
 
 ACTIVE_CLIENT_WINDOW = 300   # seconds — client is "active" if seen within this window
 DEDUP_WINDOW         = 300   # seconds — suppress repeat alerts for same client+type
+
+# Runtime-mutable config (can be changed via admin API without restart)
+_config_lock = threading.Lock()
+_runtime_config: dict = {"alert_threshold": ALERT_THRESHOLD}
+
+# In-memory admin token set (cleared on restart; that's intentional)
+_admin_lock = threading.Lock()
+_admin_tokens: set[str] = set()
+
+
+def get_alert_threshold() -> int:
+    with _config_lock:
+        return int(_runtime_config["alert_threshold"])
 
 app = Flask(__name__, static_folder="static")
 CORS(app)
@@ -351,8 +368,20 @@ def auth_check():
     if request.method == "OPTIONS":
         return
 
-    # Only POST endpoints require the agent PSK
-    if request.method == "POST" and request.path.startswith("/api/"):
+    path = request.path
+
+    # Admin endpoints: valid token required (login itself is open)
+    if path.startswith("/api/admin/"):
+        if path == "/api/admin/login":
+            return
+        token = request.headers.get("X-Admin-Token", "")
+        with _admin_lock:
+            if not token or token not in _admin_tokens:
+                return jsonify({"error": "Admin unauthorized"}), 401
+        return
+
+    # Agent POST endpoints require the PSK
+    if request.method == "POST" and path.startswith("/api/"):
         key = request.headers.get("X-Agent-Key", "")
         if key != PSK_SECRET:
             return jsonify({"error": "Unauthorized"}), 401
@@ -431,7 +460,7 @@ def report():
             (timestamp, client_id, hostname, event_type, data_json_str, score, level),
         )
 
-        if score >= ALERT_THRESHOLD and _should_alert(client_id, event_type):
+        if score >= get_alert_threshold() and _should_alert(client_id, event_type):
             _dispatch_alert(
                 {
                     "hostname": hostname,
@@ -536,6 +565,122 @@ def health():
 
 
 # ---------------------------------------------------------------------------
+# Admin endpoints — gated by ADMIN_PASSWORD login that issues a session token
+# ---------------------------------------------------------------------------
+@app.route("/api/admin/login", methods=["POST"])
+def admin_login():
+    body = request.get_json(force=True, silent=True) or {}
+    password = body.get("password", "")
+    if password != ADMIN_PASSWORD:
+        return jsonify({"error": "Invalid password"}), 401
+    token = secrets.token_urlsafe(24)
+    with _admin_lock:
+        _admin_tokens.add(token)
+    return jsonify({"token": token})
+
+
+@app.route("/api/admin/logout", methods=["POST"])
+def admin_logout():
+    token = request.headers.get("X-Admin-Token", "")
+    with _admin_lock:
+        _admin_tokens.discard(token)
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/admin/check", methods=["GET"])
+def admin_check():
+    """Probe whether a given X-Admin-Token is still valid."""
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/admin/events", methods=["DELETE"])
+def admin_delete_events():
+    """Delete all events, or only those for a specific client_id."""
+    client_id = request.args.get("client_id", "")
+    db = get_db()
+    if client_id:
+        cur = db.execute("DELETE FROM events WHERE client_id = ?", (client_id,))
+    else:
+        cur = db.execute("DELETE FROM events")
+    deleted = cur.rowcount
+    db.commit()
+    return jsonify({"deleted": deleted})
+
+
+@app.route("/api/admin/clients/<client_id>", methods=["DELETE"])
+def admin_delete_client(client_id):
+    """Remove a client and all of its events."""
+    db = get_db()
+    db.execute("DELETE FROM events WHERE client_id = ?", (client_id,))
+    cur = db.execute("DELETE FROM clients WHERE client_id = ?", (client_id,))
+    deleted = cur.rowcount
+    db.commit()
+    return jsonify({"deleted": deleted})
+
+
+@app.route("/api/admin/config", methods=["GET", "PUT"])
+def admin_config():
+    if request.method == "GET":
+        return jsonify({"alert_threshold": get_alert_threshold()})
+
+    body = request.get_json(force=True, silent=True) or {}
+    threshold = body.get("alert_threshold")
+    try:
+        threshold = int(threshold)
+    except (TypeError, ValueError):
+        return jsonify({"error": "alert_threshold must be an integer"}), 400
+    if threshold < 0 or threshold > 100:
+        return jsonify({"error": "alert_threshold must be between 0 and 100"}), 400
+    with _config_lock:
+        _runtime_config["alert_threshold"] = threshold
+    return jsonify({"alert_threshold": threshold})
+
+
+@app.route("/api/admin/vacuum", methods=["POST"])
+def admin_vacuum():
+    """Run SQLite VACUUM to reclaim space. Uses its own connection — VACUUM
+    cannot run inside an open transaction."""
+    conn = sqlite3.connect(DB_PATH, isolation_level=None)
+    try:
+        conn.execute("VACUUM")
+    finally:
+        conn.close()
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/admin/export", methods=["GET"])
+def admin_export():
+    """Full server-side export of the events table (not capped at 500)."""
+    fmt = request.args.get("format", "json").lower()
+    db = get_db()
+    rows = db.execute("SELECT * FROM events ORDER BY id DESC").fetchall()
+    data = [dict(r) for r in rows]
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    if fmt == "csv":
+        buf = io.StringIO()
+        fieldnames = ["id", "timestamp", "client_id", "hostname",
+                      "event_type", "risk_score", "risk_level", "data_json"]
+        writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(data)
+        return Response(
+            buf.getvalue(),
+            mimetype="text/csv",
+            headers={"Content-Disposition":
+                     f"attachment; filename=events_full_{today}.csv"},
+        )
+
+    return Response(
+        json.dumps(data, indent=2),
+        mimetype="application/json",
+        headers={"Content-Disposition":
+                 f"attachment; filename=events_full_{today}.json"},
+    )
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
@@ -543,6 +688,7 @@ if __name__ == "__main__":
     print(f"[*] InsiderThreat backend starting")
     print(f"[*] DB: {DB_PATH}")
     print(f"[*] Alert threshold: {ALERT_THRESHOLD}")
+    print(f"[*] Admin password: {'default (admin)' if ADMIN_PASSWORD == 'admin' else 'custom'}")
     print(f"[*] Webhook: {WEBHOOK_URL or 'disabled'}")
     print(f"[*] Email: {'enabled' if SMTP_HOST and SMTP_TO else 'disabled'}")
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)

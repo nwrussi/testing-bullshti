@@ -104,6 +104,10 @@
       stats:{total:0,high:0,med:0,low:0,active_clients:0},
       filter:'ALL',selectedClient:null,demoMode:false,error:null,
       searchQuery:'',selectedEvent:null,
+      adminToken: sessionStorage.getItem('adminToken') || null,
+      adminModal:false,
+      adminFlash:null,
+      adminThreshold:80,
     };
 
     function reducer(state,action){
@@ -119,13 +123,53 @@
         case 'SET_ERROR':    return {...state,error:action.payload};
         case 'SET_SEARCH':   return {...state,searchQuery:action.payload};
         case 'SET_SELECTED_EVENT': return {...state,selectedEvent:action.payload};
+        case 'SET_ADMIN_TOKEN': return {...state,adminToken:action.payload};
+        case 'SET_ADMIN_MODAL': return {...state,adminModal:action.payload};
+        case 'SET_ADMIN_FLASH': return {...state,adminFlash:action.payload};
+        case 'SET_ADMIN_THRESHOLD': return {...state,adminThreshold:action.payload};
         case 'TOGGLE_DEMO': {
           const on=!state.demoMode;
           const seed=on?Array.from({length:15},genDemoEvent).reverse():[];
-          return {...initialState,demoMode:on,events:seed};
+          // Preserve admin token across demo toggle
+          return {...initialState,adminToken:state.adminToken,demoMode:on,events:seed};
         }
         default: return state;
       }
+    }
+
+    // -------------------------------------------------------------------------
+    // Admin API helpers
+    // -------------------------------------------------------------------------
+    async function adminLogin(password){
+      const r=await fetch(`${API_BASE}/admin/login`,{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({password}),
+      });
+      if(!r.ok) throw new Error('Invalid password');
+      const {token}=await r.json();
+      return token;
+    }
+    async function adminFetch(path,opts={}){
+      const token=sessionStorage.getItem('adminToken')||'';
+      const headers={...(opts.headers||{}),'X-Admin-Token':token};
+      if(opts.body&&!headers['Content-Type']) headers['Content-Type']='application/json';
+      return fetch(API_BASE+path,{...opts,headers});
+    }
+    async function adminCheck(){
+      const r=await adminFetch('/admin/check');
+      return r.ok;
+    }
+    async function adminDownload(format){
+      const r=await adminFetch(`/admin/export?format=${format}`);
+      if(!r.ok) throw new Error('Export failed');
+      const blob=await r.blob();
+      const url=URL.createObjectURL(blob);
+      const a=document.createElement('a');
+      a.href=url;
+      a.download=`threat_events_full_${new Date().toISOString().slice(0,10)}.${format}`;
+      a.click();
+      URL.revokeObjectURL(url);
     }
 
     // -------------------------------------------------------------------------
@@ -226,7 +270,7 @@
       );
     }
 
-    function TopBar({demoMode,onToggle,error}){
+    function TopBar({demoMode,onToggle,error,adminToken,onAdminClick,onAdminLogout}){
       return (
         <div style={{background:'#0f172a',color:'#f8fafc',padding:'0 24px',height:56,
           display:'flex',alignItems:'center',justifyContent:'space-between',
@@ -235,10 +279,13 @@
             <span style={{fontSize:18,fontWeight:700,letterSpacing:'-0.02em'}}>
               ⚠ Insider Threat Monitor
             </span>
+            {adminToken&&<span style={{fontSize:11,color:'#fcd34d',background:'#422006',
+              border:'1px solid #854d0e',borderRadius:6,padding:'2px 10px',fontWeight:600,
+              letterSpacing:'0.05em'}}>ADMIN</span>}
             {error&&<span style={{fontSize:12,color:'#fca5a5',background:'#450a0a',
               border:'1px solid #7f1d1d',borderRadius:6,padding:'2px 10px'}}>{error}</span>}
           </div>
-          <div style={{display:'flex',alignItems:'center',gap:16}}>
+          <div style={{display:'flex',alignItems:'center',gap:12}}>
             <span style={{fontSize:12,color:'#475569'}}>
               {demoMode?'Demo data — no agent required':'Live — polling every 5s'}
             </span>
@@ -247,6 +294,205 @@
               color:demoMode?'#ede9fe':'#94a3b8'}}>
               {demoMode?'Demo ON':'Demo OFF'}
             </button>
+            {adminToken?(
+              <button onClick={onAdminLogout} title="Log out of admin"
+                style={{padding:'6px 12px',borderRadius:8,border:'1px solid #854d0e',cursor:'pointer',
+                  fontWeight:600,fontSize:13,background:'#422006',color:'#fcd34d'}}>
+                🔓 Logout
+              </button>
+            ):(
+              <button onClick={onAdminClick} title="Admin login"
+                style={{padding:'6px 12px',borderRadius:8,border:'1px solid #334155',cursor:'pointer',
+                  fontWeight:600,fontSize:13,background:'#334155',color:'#cbd5e1'}}>
+                🔒 Admin
+              </button>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    function AdminLoginModal({onSuccess,onClose}){
+      const [password,setPassword]=useState('');
+      const [error,setError]=useState('');
+      const [busy,setBusy]=useState(false);
+
+      const submit=async()=>{
+        if(busy) return;
+        setBusy(true); setError('');
+        try{
+          const token=await adminLogin(password);
+          sessionStorage.setItem('adminToken',token);
+          onSuccess(token);
+        }catch(e){
+          setError('Invalid password');
+        }finally{
+          setBusy(false);
+        }
+      };
+
+      return (
+        <div onClick={onClose} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.6)',
+          display:'flex',alignItems:'center',justifyContent:'center',zIndex:1000}}>
+          <div onClick={e=>e.stopPropagation()} style={{background:'#1e293b',border:'1px solid #334155',
+            borderRadius:12,padding:24,width:380,color:'#e2e8f0'}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
+              <span style={{fontSize:16,fontWeight:700}}>🔒 Admin Login</span>
+              <button onClick={onClose} style={{background:'transparent',border:'none',color:'#94a3b8',
+                fontSize:20,cursor:'pointer',lineHeight:1}}>×</button>
+            </div>
+            <div style={{fontSize:12,color:'#94a3b8',marginBottom:12}}>
+              Enter the admin password to unlock destructive actions.
+            </div>
+            <input type="password" value={password}
+              onChange={e=>setPassword(e.target.value)}
+              onKeyDown={e=>{if(e.key==='Enter')submit();}}
+              autoFocus placeholder="Password"
+              style={{width:'100%',padding:'10px 14px',borderRadius:8,border:'1px solid #334155',
+                background:'#0f172a',color:'#e2e8f0',fontSize:14,outline:'none',
+                fontFamily:"'Segoe UI',system-ui,sans-serif"}}
+            />
+            {error&&<div style={{marginTop:10,color:'#fca5a5',fontSize:12}}>{error}</div>}
+            <div style={{marginTop:16,display:'flex',gap:8,justifyContent:'flex-end'}}>
+              <button onClick={onClose} style={{padding:'8px 16px',borderRadius:8,border:'1px solid #334155',
+                background:'transparent',color:'#94a3b8',fontSize:13,cursor:'pointer'}}>Cancel</button>
+              <button onClick={submit} disabled={busy} style={{padding:'8px 16px',borderRadius:8,border:'none',
+                background:'#7c3aed',color:'#ede9fe',fontSize:13,fontWeight:600,
+                cursor:busy?'not-allowed':'pointer',opacity:busy?0.6:1}}>
+                {busy?'...':'Unlock'}
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function AdminPanel({selectedClient,flash,onFlash,onLogout,threshold,onThreshold}){
+      const [localThreshold,setLocalThreshold]=useState(threshold);
+      useEffect(()=>{setLocalThreshold(threshold);},[threshold]);
+
+      // Load current threshold on mount
+      useEffect(()=>{
+        (async()=>{
+          try{
+            const r=await adminFetch('/admin/config');
+            if(r.ok){
+              const cfg=await r.json();
+              onThreshold(cfg.alert_threshold);
+              setLocalThreshold(cfg.alert_threshold);
+            }
+          }catch{}
+        })();
+      },[]);
+
+      const confirmAnd=(msg,fn)=>async()=>{
+        if(!window.confirm(msg)) return;
+        try{ await fn(); }
+        catch(e){ onFlash({kind:'err',text:e.message||'Action failed'}); }
+      };
+
+      const saveThreshold=async()=>{
+        const n=parseInt(localThreshold,10);
+        if(isNaN(n)||n<0||n>100){
+          onFlash({kind:'err',text:'Threshold must be 0–100'});
+          return;
+        }
+        const r=await adminFetch('/admin/config',{method:'PUT',body:JSON.stringify({alert_threshold:n})});
+        if(!r.ok){ onFlash({kind:'err',text:'Failed to update threshold'}); return; }
+        onThreshold(n);
+        onFlash({kind:'ok',text:`Alert threshold set to ${n}`});
+      };
+
+      const clearAll=confirmAnd('Delete ALL events from the database? This cannot be undone.',async()=>{
+        const r=await adminFetch('/admin/events',{method:'DELETE'});
+        if(!r.ok) throw new Error('Delete failed');
+        const {deleted}=await r.json();
+        onFlash({kind:'ok',text:`Deleted ${deleted} events`});
+      });
+
+      const clearClientEvents=confirmAnd(
+        selectedClient?`Delete all events for ${selectedClient.hostname}?`:'',
+        async()=>{
+          const r=await adminFetch(`/admin/events?client_id=${encodeURIComponent(selectedClient.client_id)}`,{method:'DELETE'});
+          if(!r.ok) throw new Error('Delete failed');
+          const {deleted}=await r.json();
+          onFlash({kind:'ok',text:`Deleted ${deleted} events for ${selectedClient.hostname}`});
+        }
+      );
+
+      const deleteClient=confirmAnd(
+        selectedClient?`Delete client ${selectedClient.hostname} AND all its events?`:'',
+        async()=>{
+          const r=await adminFetch(`/admin/clients/${encodeURIComponent(selectedClient.client_id)}`,{method:'DELETE'});
+          if(!r.ok) throw new Error('Delete failed');
+          onFlash({kind:'ok',text:`Removed client ${selectedClient.hostname}`});
+        }
+      );
+
+      const vacuum=async()=>{
+        try{
+          const r=await adminFetch('/admin/vacuum',{method:'POST'});
+          if(!r.ok) throw new Error('Vacuum failed');
+          onFlash({kind:'ok',text:'Database vacuumed'});
+        }catch(e){ onFlash({kind:'err',text:e.message}); }
+      };
+
+      const exportAll=(fmt)=>async()=>{
+        try{ await adminDownload(fmt); onFlash({kind:'ok',text:`Exported as ${fmt.toUpperCase()}`}); }
+        catch(e){ onFlash({kind:'err',text:e.message}); }
+      };
+
+      const btn={padding:'6px 12px',borderRadius:6,border:'1px solid #334155',
+        background:'#0f172a',color:'#cbd5e1',fontSize:12,cursor:'pointer',fontWeight:500};
+      const btnDanger={...btn,border:'1px solid #7f1d1d',color:'#fca5a5',background:'#1a0a0a'};
+      const btnDisabled={...btn,opacity:0.4,cursor:'not-allowed'};
+
+      return (
+        <div style={{background:'#1a1530',border:'1px solid #3b2e66',borderRadius:8,
+          padding:'12px 16px',margin:'0 20px',marginTop:12,flexShrink:0}}>
+          <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:10}}>
+            <span style={{fontSize:12,fontWeight:700,color:'#c4b5fd',letterSpacing:'0.05em'}}>
+              🔓 ADMIN PANEL
+            </span>
+            {flash&&<span style={{fontSize:11,padding:'2px 10px',borderRadius:4,
+              background:flash.kind==='ok'?'#052e1a':'#450a0a',
+              color:flash.kind==='ok'?'#6ee7b7':'#fca5a5',
+              border:`1px solid ${flash.kind==='ok'?'#065f46':'#7f1d1d'}`}}>
+              {flash.text}
+            </span>}
+          </div>
+
+          <div style={{display:'flex',gap:16,flexWrap:'wrap',alignItems:'center'}}>
+            {/* Alert threshold */}
+            <div style={{display:'flex',alignItems:'center',gap:6}}>
+              <span style={{fontSize:11,color:'#94a3b8'}}>Alert threshold:</span>
+              <input type="number" min="0" max="100" value={localThreshold}
+                onChange={e=>setLocalThreshold(e.target.value)}
+                style={{width:60,padding:'4px 8px',borderRadius:4,border:'1px solid #334155',
+                  background:'#0f172a',color:'#e2e8f0',fontSize:12}}/>
+              <button onClick={saveThreshold} style={btn}>Save</button>
+            </div>
+
+            <span style={{color:'#334155'}}>|</span>
+
+            {/* Destructive actions */}
+            <button onClick={clearAll} style={btnDanger}>Clear ALL events</button>
+            <button onClick={selectedClient?clearClientEvents:undefined}
+              style={selectedClient?btnDanger:btnDisabled}
+              title={selectedClient?'':'Select a client first'}>
+              Clear events for selected
+            </button>
+            <button onClick={selectedClient?deleteClient:undefined}
+              style={selectedClient?btnDanger:btnDisabled}
+              title={selectedClient?'':'Select a client first'}>
+              Delete selected client
+            </button>
+
+            <span style={{color:'#334155'}}>|</span>
+
+            <button onClick={vacuum} style={btn}>Vacuum DB</button>
+            <button onClick={exportAll('csv')} style={btn}>Export all (CSV)</button>
+            <button onClick={exportAll('json')} style={btn}>Export all (JSON)</button>
           </div>
         </div>
       );
@@ -549,6 +795,39 @@
 
       const handleToggleDemo=useCallback(()=>{lastIdRef.current=0;dispatch({type:'TOGGLE_DEMO'});},[]);
 
+      // Admin handlers
+      const handleAdminClick=useCallback(()=>dispatch({type:'SET_ADMIN_MODAL',payload:true}),[]);
+      const handleAdminClose=useCallback(()=>dispatch({type:'SET_ADMIN_MODAL',payload:false}),[]);
+      const handleAdminSuccess=useCallback((token)=>{
+        dispatch({type:'SET_ADMIN_TOKEN',payload:token});
+        dispatch({type:'SET_ADMIN_MODAL',payload:false});
+        dispatch({type:'SET_ADMIN_FLASH',payload:{kind:'ok',text:'Admin mode unlocked'}});
+      },[]);
+      const handleAdminLogout=useCallback(async()=>{
+        try{ await adminFetch('/admin/logout',{method:'POST'}); }catch{}
+        sessionStorage.removeItem('adminToken');
+        dispatch({type:'SET_ADMIN_TOKEN',payload:null});
+        dispatch({type:'SET_ADMIN_FLASH',payload:null});
+      },[]);
+      const handleAdminFlash=useCallback((f)=>{
+        dispatch({type:'SET_ADMIN_FLASH',payload:f});
+        if(f) setTimeout(()=>dispatch({type:'SET_ADMIN_FLASH',payload:null}),4000);
+      },[]);
+      const handleSetThreshold=useCallback((n)=>dispatch({type:'SET_ADMIN_THRESHOLD',payload:n}),[]);
+
+      // On mount, validate any saved admin token so we don't show a stale ADMIN badge
+      useEffect(()=>{
+        const saved=sessionStorage.getItem('adminToken');
+        if(!saved) return;
+        (async()=>{
+          const ok=await adminCheck();
+          if(!ok){
+            sessionStorage.removeItem('adminToken');
+            dispatch({type:'SET_ADMIN_TOKEN',payload:null});
+          }
+        })();
+      },[]);
+
       // Request notification permission on first interaction
       useEffect(()=>{
         const handler=()=>{requestNotifPermission();document.removeEventListener('click',handler);};
@@ -572,8 +851,22 @@
           background:'#0f172a',color:'#f1f5f9',
           fontFamily:"'Segoe UI',system-ui,sans-serif",overflow:'hidden'}}>
 
-          <TopBar demoMode={state.demoMode} onToggle={handleToggleDemo} error={state.error}/>
+          <TopBar demoMode={state.demoMode} onToggle={handleToggleDemo} error={state.error}
+            adminToken={state.adminToken}
+            onAdminClick={handleAdminClick}
+            onAdminLogout={handleAdminLogout}/>
           <StatCards stats={state.stats}/>
+
+          {state.adminToken&&!state.demoMode&&(
+            <AdminPanel
+              selectedClient={state.selectedClient}
+              flash={state.adminFlash}
+              onFlash={handleAdminFlash}
+              onLogout={handleAdminLogout}
+              threshold={state.adminThreshold}
+              onThreshold={handleSetThreshold}
+            />
+          )}
 
           {/* Body */}
           <div style={{display:'flex',flex:1,overflow:'hidden',marginTop:16}}>
@@ -604,6 +897,10 @@
 
           <EventModal ev={state.selectedEvent}
             onClose={()=>dispatch({type:'SET_SELECTED_EVENT',payload:null})}/>
+
+          {state.adminModal&&(
+            <AdminLoginModal onSuccess={handleAdminSuccess} onClose={handleAdminClose}/>
+          )}
         </div>
       );
     }
