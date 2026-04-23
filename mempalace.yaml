@@ -1,0 +1,10 @@
+wing: insiderthreatdetector_main
+rooms:
+- name: static
+  description: Files from static/
+  keywords:
+  - static
+  - static
+- name: general
+  description: Files that don't fit other rooms
+  keywords: []
