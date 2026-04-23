@@ -29,7 +29,6 @@
     // -------------------------------------------------------------------------
     const API_BASE       = '/api';
     const POLL_INTERVAL  = 5000;
-    const MAX_EVENTS     = 500;
 
     const RISK = {
       HIGH: { bg: '#fee2e2', color: '#991b1b', border: '#fca5a5', dot: '#ef4444' },
@@ -43,7 +42,6 @@
     const DEPARTMENTS = ["HR", "FIN", "ENG", "MKT", "EXEC", "OPS", "IT", "LEGAL", "SALES", "RND"];
     const DEVICE_TYPES = ["LT", "WS", "DT", "VM"];
 
-    // Generate 120 random corporate hostnames
     const DEMO_HOSTS = Array.from({ length: 120 }, (_, i) => {
       const dept = DEPARTMENTS[Math.floor(Math.random() * DEPARTMENTS.length)];
       const type = DEVICE_TYPES[Math.floor(Math.random() * DEVICE_TYPES.length)];
@@ -51,13 +49,13 @@
       return `${dept}-${type}-${num}`;
     });
 
-    // Add some high-value targets for flavor
     DEMO_HOSTS.push("DC-PROD-01", "EXCHANGE-01", "FILESHARE-02", "CEO-LAPTOP", "BASTION-HOST");
 
     const DEMO_PROCS    = [
       ['chrome.exe','LOW'],['excel.exe','LOW'],['outlook.exe','LOW'],['teams.exe','LOW'],
-      ['wireshark.exe','MED'],['psexec.exe','MED'],['powershell.exe','LOW'],
-      ['mimikatz.exe','HIGH'],['nmap.exe','MED'],['putty.exe','LOW'],['filezilla.exe','LOW']
+      ['wireshark.exe','MED'],['psexec.exe','MED'],['powershell.exe','LOW'],['cmd.exe', 'LOW'],
+      ['mimikatz.exe','HIGH'],['cobaltstrike.exe','HIGH'],['bloodhound.exe','HIGH'],['rubeus.exe','HIGH'],
+      ['nmap.exe','MED'],['putty.exe','LOW'],['filezilla.exe','LOW'],['procdump.exe','MED']
     ];
     const DEMO_KEYWORDS = ['password','api_key','-----BEGIN PRIVATE KEY','ssn','credit card'];
     const DEMO_WINDOWS  = ['Excel - Q4_Salaries.xlsx','Chrome - Gmail','Notepad - credentials.txt','FileZilla','PowerShell'];
@@ -78,14 +76,13 @@
       for(const x of arr){ r-=x.weight; if(r<=0) return x; } 
       return arr[arr.length-1]; 
     }
-    
     function rand(a){ return a[Math.floor(Math.random()*a.length)]; }
 
     function genDemoEvent() {
       const host = rand(DEMO_HOSTS);
       const cid  = host.toLowerCase().replace(/-/g,'');
       const {type} = pickW(DEMO_EVENT_TYPES);
-      const ah = false; // Turned off random after-hours for realistic demo
+      const ah = false; 
       let data={}, level='LOW', score=10;
 
       if(type==='PROCESS'){
@@ -94,8 +91,13 @@
         score=lvl==='HIGH'?85+Math.floor(Math.random()*15):lvl==='MED'?50+Math.floor(Math.random()*25):10+Math.floor(Math.random()*30);
         data={name,pid:1000+Math.floor(Math.random()*30000)};
       } else if(type==='CLIPBOARD'){
-        level='MED'; score=50+Math.floor(Math.random()*20);
-        data={keyword:rand(DEMO_KEYWORDS),char_count:50+Math.floor(Math.random()*500)};
+        const kw = rand(DEMO_KEYWORDS);
+        if (kw.includes("PRIVATE KEY") || kw.includes("api_key")) {
+            level = 'HIGH'; score = 85;
+        } else {
+            level = 'MED'; score = 50 + Math.floor(Math.random() * 20);
+        }
+        data={keyword:kw,char_count:50+Math.floor(Math.random()*500)};
       } else if(type==='USB_INSERT'){
         level='LOW'; score=25; data={event:'arrival',device_type:'mass_storage'};
       } else if(type==='USB_REMOVE'){
@@ -103,24 +105,39 @@
       } else if(type==='WINDOW'){
         level='LOW'; score=0; data={title:rand(DEMO_WINDOWS)};
       } else if(type==='NETWORK_UPLOAD'){
-        const mb=10+Math.floor(Math.random()*150);
-        level=mb>100?'MED':'LOW'; score=mb>100?60:30;
+        const mb=10+Math.floor(Math.random()*590);
+        if (mb >= 500) { level = 'HIGH'; score = 85; } 
+        else if (mb >= 100) { level = 'MED'; score = 60; } 
+        else { level = 'LOW'; score = 30; }
         data={bytes_out:mb*1024*1024,window_sec:30};
       }
       
       return {id:++_demoId,timestamp:new Date().toISOString(),client_id:cid,hostname:host,event_type:type,data_json:JSON.stringify(data),risk_score:score,risk_level:level,after_hours:ah};
     }
 
-    function buildDemoClients(events) {
+    function buildClientsFromEvents(events, isDemo) {
       const m={};
       for(const e of events){
-        if(!m[e.client_id]) m[e.client_id]={client_id:e.client_id,hostname:e.hostname,ip:'10.1.'+(Math.floor(Math.random()*250)+1)+'.'+(Math.floor(Math.random()*250)+1),last_seen:e.timestamp,max_risk_score:e.risk_score};
+        if(!m[e.client_id]) m[e.client_id]={
+            client_id:e.client_id,
+            hostname:e.hostname,
+            ip: isDemo ? '10.1.'+(Math.floor(Math.random()*250)+1)+'.'+(Math.floor(Math.random()*250)+1) : 'Archived',
+            last_seen:e.timestamp,
+            max_risk_score:e.risk_score
+        };
         else { 
             if(e.risk_score>m[e.client_id].max_risk_score) m[e.client_id].max_risk_score=e.risk_score; 
             if(e.timestamp>m[e.client_id].last_seen) m[e.client_id].last_seen=e.timestamp;
         }
       }
       return Object.values(m).sort((a,b)=>b.max_risk_score-a.max_risk_score);
+    }
+
+    function calcStats(events, activeClients) {
+        const high = events.filter(e=>e.risk_level==='HIGH').length;
+        const med = events.filter(e=>e.risk_level==='MED').length;
+        const low = events.filter(e=>e.risk_level==='LOW').length;
+        return {total: events.length, high, med, low, active_clients: activeClients};
     }
 
     // -------------------------------------------------------------------------
@@ -135,12 +152,17 @@
       adminModal:false,
       adminFlash:null,
       adminThreshold:80,
+      
+      // Historical Mode State
+      isHistorical: false,
+      historicalFilename: null,
     };
 
     function reducer(state,action){
       switch(action.type){
         case 'PREPEND': {
-          const merged=[...action.payload,...state.events].slice(0,MAX_EVENTS);
+          // NO LIMIT: Events accumulate indefinitely
+          const merged=[...action.payload,...state.events];
           return {...state,events:merged,error:null};
         }
         case 'SET_CLIENTS':  return {...state,clients:action.payload};
@@ -154,12 +176,36 @@
         case 'SET_ADMIN_MODAL': return {...state,adminModal:action.payload};
         case 'SET_ADMIN_FLASH': return {...state,adminFlash:action.payload};
         case 'SET_ADMIN_THRESHOLD': return {...state,adminThreshold:action.payload};
+        
+        case 'CLEAR_EVENTS': 
+          return { ...state, events: [], error: null };
+
         case 'TOGGLE_DEMO': {
           const on=!state.demoMode;
-          // Seed with 150 items instantly to populate the dashboard
           const seed=on?Array.from({length:150},genDemoEvent).reverse():[];
-          return {...initialState,adminToken:state.adminToken,demoMode:on,events:seed};
+          return {...initialState,adminToken:state.adminToken,demoMode:on,events:seed, isHistorical: false};
         }
+
+        // LOAD HISTORICAL DATA
+        case 'LOAD_HISTORICAL': {
+          const { events, filename } = action.payload;
+          const clients = buildClientsFromEvents(events, false);
+          return {
+            ...initialState,
+            adminToken: state.adminToken,
+            isHistorical: true,
+            historicalFilename: filename,
+            demoMode: false,
+            events: events,
+            clients: clients,
+            stats: calcStats(events, clients.length)
+          };
+        }
+
+        case 'EXIT_HISTORICAL': {
+          return { ...initialState, adminToken: state.adminToken };
+        }
+
         default: return state;
       }
     }
@@ -168,14 +214,9 @@
     // Admin API helpers
     // -------------------------------------------------------------------------
     async function adminLogin(password){
-      const r=await fetch(`${API_BASE}/admin/login`,{
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({password}),
-      });
+      const r=await fetch(`${API_BASE}/admin/login`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})});
       if(!r.ok) throw new Error('Invalid password');
-      const {token}=await r.json();
-      return token;
+      const {token}=await r.json(); return token;
     }
     async function adminFetch(path,opts={}){
       const token=sessionStorage.getItem('adminToken')||'';
@@ -183,20 +224,13 @@
       if(opts.body&&!headers['Content-Type']) headers['Content-Type']='application/json';
       return fetch(API_BASE+path,{...opts,headers});
     }
-    async function adminCheck(){
-      const r=await adminFetch('/admin/check');
-      return r.ok;
-    }
+    async function adminCheck(){ const r=await adminFetch('/admin/check'); return r.ok; }
     async function adminDownload(format){
       const r=await adminFetch(`/admin/export?format=${format}`);
       if(!r.ok) throw new Error('Export failed');
-      const blob=await r.blob();
-      const url=URL.createObjectURL(blob);
-      const a=document.createElement('a');
-      a.href=url;
-      a.download=`threat_events_full_${new Date().toISOString().slice(0,10)}.${format}`;
-      a.click();
-      URL.revokeObjectURL(url);
+      const blob=await r.blob(); const url=URL.createObjectURL(blob); const a=document.createElement('a');
+      a.href=url; a.download=`threat_events_full_${new Date().toISOString().slice(0,10)}.${format}`;
+      a.click(); URL.revokeObjectURL(url);
     }
 
     // -------------------------------------------------------------------------
@@ -214,10 +248,7 @@
       if(n>=1024)       return (n/1024).toFixed(1)+' KB';
       return n+' B';
     }
-    function parseData(ev){
-      try{ return typeof ev.data_json==='string'?JSON.parse(ev.data_json):ev.data_json; }
-      catch{ return {}; }
-    }
+    function parseData(ev){ try{ return typeof ev.data_json==='string'?JSON.parse(ev.data_json):ev.data_json; } catch{ return {}; } }
     function summary(ev){
       const d=parseData(ev);
       switch(ev.event_type){
@@ -231,7 +262,6 @@
       }
     }
     function lvlOf(score){ return score>=80?'HIGH':score>=50?'MED':'LOW'; }
-
     function relativeTime(ts){
       if(!ts) return '';
       try{
@@ -247,40 +277,27 @@
     function exportData(events,format){
       let content,mime,ext;
       if(format==='json'){
-        content=JSON.stringify(events,null,2);
-        mime='application/json'; ext='json';
+        content=JSON.stringify(events,null,2); mime='application/json'; ext='json';
       } else {
         const headers='id,timestamp,hostname,client_id,event_type,risk_score,risk_level,after_hours,summary';
         const rows=events.map(e=>[e.id,e.timestamp,e.hostname,e.client_id,e.event_type,e.risk_score,e.risk_level,e.after_hours,'"'+summary(e).replace(/"/g,'""')+'"'].join(','));
-        content=headers+'\n'+rows.join('\n');
-        mime='text/csv'; ext='csv';
+        content=headers+'\n'+rows.join('\n'); mime='text/csv'; ext='csv';
       }
-      const blob=new Blob([content],{type:mime});
-      const url=URL.createObjectURL(blob);
-      const a=document.createElement('a');
-      a.href=url; a.download=`threat_events_${new Date().toISOString().slice(0,10)}.${ext}`;
+      const blob=new Blob([content],{type:mime}); const url=URL.createObjectURL(blob);
+      const a=document.createElement('a'); a.href=url; a.download=`threat_events_${new Date().toISOString().slice(0,10)}.${ext}`;
       a.click(); URL.revokeObjectURL(url);
     }
 
     let _notifPermission=typeof Notification!=='undefined'?Notification.permission:'denied';
     function requestNotifPermission(){
-      if(typeof Notification!=='undefined'&&_notifPermission==='default'){
-        Notification.requestPermission().then(p=>{_notifPermission=p;});
-      }
+      if(typeof Notification!=='undefined'&&_notifPermission==='default'){ Notification.requestPermission().then(p=>{_notifPermission=p;}); }
     }
     function notifyHigh(ev){
       if(_notifPermission!=='granted') return;
-      new Notification('HIGH Risk Event',{
-        body:`${ev.hostname}: ${summary(ev)}`,
-        icon:'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">⚠</text></svg>',
-        tag:'threat-'+ev.id,
-      });
+      new Notification('HIGH Risk Event',{body:`${ev.hostname}: ${summary(ev)}`,icon:'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">⚠</text></svg>',tag:'threat-'+ev.id,});
     }
 
-    const TYPE_COLOR = {
-      PROCESS:'#7c3aed',CLIPBOARD:'#d97706',USB_INSERT:'#0891b2',
-      USB_REMOVE:'#6b7280',WINDOW:'#374151',NETWORK_UPLOAD:'#dc2626',
-    };
+    const TYPE_COLOR = { PROCESS:'#7c3aed',CLIPBOARD:'#d97706',USB_INSERT:'#0891b2', USB_REMOVE:'#6b7280',WINDOW:'#374151',NETWORK_UPLOAD:'#dc2626' };
 
     // -------------------------------------------------------------------------
     // Components
@@ -289,48 +306,63 @@
       const s=RISK[level]||RISK.LOW;
       return (
         <span style={{display:'inline-flex',alignItems:'center',gap:4,padding:'2px 8px',borderRadius:9999,
-          fontSize:11,fontWeight:700,letterSpacing:'0.05em',
-          background:s.bg,color:s.color,border:`1px solid ${s.border}`,whiteSpace:'nowrap'}}>
+          fontSize:11,fontWeight:700,letterSpacing:'0.05em',background:s.bg,color:s.color,border:`1px solid ${s.border}`,whiteSpace:'nowrap'}}>
           <span style={{width:6,height:6,borderRadius:'50%',background:s.dot,flexShrink:0}}/>
           {level}{score!=null?' '+score:''}
         </span>
       );
     }
 
-    function TopBar({demoMode,onToggle,error,adminToken,onAdminClick,onAdminLogout}){
+    function TopBar({state, onToggleDemo, onExitHistorical, onFileUpload, onAdminClick, onAdminLogout}){
+      const fileInputRef = useRef(null);
+
       return (
-        <div style={{background:'#0f172a',color:'#f8fafc',padding:'0 24px',height:56,
-          display:'flex',alignItems:'center',justifyContent:'space-between',
-          borderBottom:'1px solid #1e293b',flexShrink:0}}>
+        <div style={{background:'#0f172a',color:'#f8fafc',padding:'0 24px',height:56, display:'flex',alignItems:'center',justifyContent:'space-between', borderBottom:'1px solid #1e293b',flexShrink:0}}>
           <div style={{display:'flex',alignItems:'center',gap:12}}>
             <span style={{fontSize:18,fontWeight:700,letterSpacing:'-0.02em'}}>
               ⚠ Insider Threat Monitor
             </span>
-            {adminToken&&<span style={{fontSize:11,color:'#fcd34d',background:'#422006',
-              border:'1px solid #854d0e',borderRadius:6,padding:'2px 10px',fontWeight:600,
-              letterSpacing:'0.05em'}}>ADMIN</span>}
-            {error&&<span style={{fontSize:12,color:'#fca5a5',background:'#450a0a',
-              border:'1px solid #7f1d1d',borderRadius:6,padding:'2px 10px'}}>{error}</span>}
+            {state.isHistorical && (
+              <span style={{fontSize:11,color:'#38bdf8',background:'#082f49', border:'1px solid #0284c7',borderRadius:6,padding:'2px 10px',fontWeight:600}}>
+                ARCHIVE: {state.historicalFilename}
+              </span>
+            )}
+            {state.adminToken && !state.isHistorical && <span style={{fontSize:11,color:'#fcd34d',background:'#422006', border:'1px solid #854d0e',borderRadius:6,padding:'2px 10px',fontWeight:600}}>ADMIN</span>}
+            {state.error && <span style={{fontSize:12,color:'#fca5a5',background:'#450a0a', border:'1px solid #7f1d1d',borderRadius:6,padding:'2px 10px'}}>{state.error}</span>}
           </div>
+          
           <div style={{display:'flex',alignItems:'center',gap:12}}>
-            <span style={{fontSize:12,color:'#475569'}}>
-              {demoMode?'Demo data — no agent required':'Live — polling every 5s'}
-            </span>
-            <button onClick={onToggle} style={{padding:'6px 16px',borderRadius:8,border:'none',cursor:'pointer',
-              fontWeight:600,fontSize:13,background:demoMode?'#7c3aed':'#334155',
-              color:demoMode?'#ede9fe':'#94a3b8'}}>
-              {demoMode?'Demo ON':'Demo OFF'}
-            </button>
-            {adminToken?(
-              <button onClick={onAdminLogout} title="Log out of admin"
-                style={{padding:'6px 12px',borderRadius:8,border:'1px solid #854d0e',cursor:'pointer',
-                  fontWeight:600,fontSize:13,background:'#422006',color:'#fcd34d'}}>
+            {!state.isHistorical && (
+              <span style={{fontSize:12,color:'#475569'}}>
+                {state.demoMode?'Demo data — no agent required':'Live — polling every 5s'}
+              </span>
+            )}
+            
+            {/* Historical Load Button */}
+            {!state.isHistorical ? (
+                <>
+                    <input type="file" accept=".json" style={{display:'none'}} ref={fileInputRef} onChange={onFileUpload} />
+                    <button onClick={() => fileInputRef.current.click()} title="Load Historical JSON Archive"
+                        style={{padding:'6px 16px',borderRadius:8,border:'1px solid #38bdf8',cursor:'pointer',fontWeight:600,fontSize:13,background:'transparent',color:'#38bdf8'}}>
+                        📂 Load Log
+                    </button>
+                    
+                    <button onClick={onToggleDemo} style={{padding:'6px 16px',borderRadius:8,border:'none',cursor:'pointer', fontWeight:600,fontSize:13,background:state.demoMode?'#7c3aed':'#334155', color:state.demoMode?'#ede9fe':'#94a3b8'}}>
+                      {state.demoMode?'Demo ON':'Demo OFF'}
+                    </button>
+                </>
+            ) : (
+                <button onClick={onExitHistorical} style={{padding:'6px 16px',borderRadius:8,border:'1px solid #ef4444',cursor:'pointer', fontWeight:600,fontSize:13,background:'#7f1d1d', color:'#fca5a5'}}>
+                   Exit Archive
+                </button>
+            )}
+
+            {state.adminToken && !state.isHistorical ? (
+              <button onClick={onAdminLogout} title="Log out of admin" style={{padding:'6px 12px',borderRadius:8,border:'1px solid #854d0e',cursor:'pointer', fontWeight:600,fontSize:13,background:'#422006',color:'#fcd34d'}}>
                 🔓 Logout
               </button>
-            ):(
-              <button onClick={onAdminClick} title="Admin login"
-                style={{padding:'6px 12px',borderRadius:8,border:'1px solid #334155',cursor:'pointer',
-                  fontWeight:600,fontSize:13,background:'#334155',color:'#cbd5e1'}}>
+            ): (!state.isHistorical && 
+              <button onClick={onAdminClick} title="Admin login" style={{padding:'6px 12px',borderRadius:8,border:'1px solid #334155',cursor:'pointer', fontWeight:600,fontSize:13,background:'#334155',color:'#cbd5e1'}}>
                 🔒 Admin
               </button>
             )}
@@ -340,199 +372,33 @@
     }
 
     function AdminLoginModal({onSuccess,onClose}){
-      const [password,setPassword]=useState('');
-      const [error,setError]=useState('');
-      const [busy,setBusy]=useState(false);
-
-      const submit=async()=>{
-        if(busy) return;
-        setBusy(true); setError('');
-        try{
-          const token=await adminLogin(password);
-          sessionStorage.setItem('adminToken',token);
-          onSuccess(token);
-        }catch(e){
-          setError('Invalid password');
-        }finally{
-          setBusy(false);
-        }
-      };
-
-      return (
-        <div onClick={onClose} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.6)',
-          display:'flex',alignItems:'center',justifyContent:'center',zIndex:1000}}>
-          <div onClick={e=>e.stopPropagation()} style={{background:'#1e293b',border:'1px solid #334155',
-            borderRadius:12,padding:24,width:380,color:'#e2e8f0'}}>
-            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
-              <span style={{fontSize:16,fontWeight:700}}>🔒 Admin Login</span>
-              <button onClick={onClose} style={{background:'transparent',border:'none',color:'#94a3b8',
-                fontSize:20,cursor:'pointer',lineHeight:1}}>×</button>
-            </div>
-            <div style={{fontSize:12,color:'#94a3b8',marginBottom:12}}>
-              Enter the admin password to unlock destructive actions.
-            </div>
-            <input type="password" value={password}
-              onChange={e=>setPassword(e.target.value)}
-              onKeyDown={e=>{if(e.key==='Enter')submit();}}
-              autoFocus placeholder="Password"
-              style={{width:'100%',padding:'10px 14px',borderRadius:8,border:'1px solid #334155',
-                background:'#0f172a',color:'#e2e8f0',fontSize:14,outline:'none',
-                fontFamily:"'Segoe UI',system-ui,sans-serif"}}
-            />
-            {error&&<div style={{marginTop:10,color:'#fca5a5',fontSize:12}}>{error}</div>}
-            <div style={{marginTop:16,display:'flex',gap:8,justifyContent:'flex-end'}}>
-              <button onClick={onClose} style={{padding:'8px 16px',borderRadius:8,border:'1px solid #334155',
-                background:'transparent',color:'#94a3b8',fontSize:13,cursor:'pointer'}}>Cancel</button>
-              <button onClick={submit} disabled={busy} style={{padding:'8px 16px',borderRadius:8,border:'none',
-                background:'#7c3aed',color:'#ede9fe',fontSize:13,fontWeight:600,
-                cursor:busy?'not-allowed':'pointer',opacity:busy?0.6:1}}>
-                {busy?'...':'Unlock'}
-              </button>
-            </div>
-          </div>
-        </div>
-      );
+        const [password,setPassword]=useState(''); const [error,setError]=useState(''); const [busy,setBusy]=useState(false);
+        const submit=async()=>{ if(busy) return; setBusy(true); setError(''); try{ const token=await adminLogin(password); sessionStorage.setItem('adminToken',token); onSuccess(token); }catch(e){ setError('Invalid password'); }finally{ setBusy(false); } };
+        return ( <div onClick={onClose} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.6)', display:'flex',alignItems:'center',justifyContent:'center',zIndex:1000}}> <div onClick={e=>e.stopPropagation()} style={{background:'#1e293b',border:'1px solid #334155', borderRadius:12,padding:24,width:380,color:'#e2e8f0'}}> <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}> <span style={{fontSize:16,fontWeight:700}}>🔒 Admin Login</span> <button onClick={onClose} style={{background:'transparent',border:'none',color:'#94a3b8', fontSize:20,cursor:'pointer',lineHeight:1}}>×</button> </div> <div style={{fontSize:12,color:'#94a3b8',marginBottom:12}}> Enter the admin password to unlock destructive actions. </div> <input type="password" value={password} onChange={e=>setPassword(e.target.value)} onKeyDown={e=>{if(e.key==='Enter')submit();}} autoFocus placeholder="Password" style={{width:'100%',padding:'10px 14px',borderRadius:8,border:'1px solid #334155', background:'#0f172a',color:'#e2e8f0',fontSize:14,outline:'none', fontFamily:"'Segoe UI',system-ui,sans-serif"}} /> {error&&<div style={{marginTop:10,color:'#fca5a5',fontSize:12}}>{error}</div>} <div style={{marginTop:16,display:'flex',gap:8,justifyContent:'flex-end'}}> <button onClick={onClose} style={{padding:'8px 16px',borderRadius:8,border:'1px solid #334155', background:'transparent',color:'#94a3b8',fontSize:13,cursor:'pointer'}}>Cancel</button> <button onClick={submit} disabled={busy} style={{padding:'8px 16px',borderRadius:8,border:'none', background:'#7c3aed',color:'#ede9fe',fontSize:13,fontWeight:600, cursor:busy?'not-allowed':'pointer',opacity:busy?0.6:1}}> {busy?'...':'Unlock'} </button> </div> </div> </div> );
     }
 
     function AdminPanel({selectedClient,flash,onFlash,onLogout,threshold,onThreshold}){
-      const [localThreshold,setLocalThreshold]=useState(threshold);
-      useEffect(()=>{setLocalThreshold(threshold);},[threshold]);
-
-      // Load current threshold on mount
-      useEffect(()=>{
-        (async()=>{
-          try{
-            const r=await adminFetch('/admin/config');
-            if(r.ok){
-              const cfg=await r.json();
-              onThreshold(cfg.alert_threshold);
-              setLocalThreshold(cfg.alert_threshold);
-            }
-          }catch{}
-        })();
-      },[]);
-
-      const confirmAnd=(msg,fn)=>async()=>{
-        if(!window.confirm(msg)) return;
-        try{ await fn(); }
-        catch(e){ onFlash({kind:'err',text:e.message||'Action failed'}); }
-      };
-
-      const saveThreshold=async()=>{
-        const n=parseInt(localThreshold,10);
-        if(isNaN(n)||n<0||n>100){
-          onFlash({kind:'err',text:'Threshold must be 0–100'});
-          return;
-        }
-        const r=await adminFetch('/admin/config',{method:'PUT',body:JSON.stringify({alert_threshold:n})});
-        if(!r.ok){ onFlash({kind:'err',text:'Failed to update threshold'}); return; }
-        onThreshold(n);
-        onFlash({kind:'ok',text:`Alert threshold set to ${n}`});
-      };
-
-      const clearAll=confirmAnd('Delete ALL events from the database? This cannot be undone.',async()=>{
-        const r=await adminFetch('/admin/events',{method:'DELETE'});
-        if(!r.ok) throw new Error('Delete failed');
-        const {deleted}=await r.json();
-        onFlash({kind:'ok',text:`Deleted ${deleted} events`});
-      });
-
-      const clearClientEvents=confirmAnd(
-        selectedClient?`Delete all events for ${selectedClient.hostname}?`:'',
-        async()=>{
-          const r=await adminFetch(`/admin/events?client_id=${encodeURIComponent(selectedClient.client_id)}`,{method:'DELETE'});
-          if(!r.ok) throw new Error('Delete failed');
-          const {deleted}=await r.json();
-          onFlash({kind:'ok',text:`Deleted ${deleted} events for ${selectedClient.hostname}`});
-        }
-      );
-
-      const deleteClient=confirmAnd(
-        selectedClient?`Delete client ${selectedClient.hostname} AND all its events?`:'',
-        async()=>{
-          const r=await adminFetch(`/admin/clients/${encodeURIComponent(selectedClient.client_id)}`,{method:'DELETE'});
-          if(!r.ok) throw new Error('Delete failed');
-          onFlash({kind:'ok',text:`Removed client ${selectedClient.hostname}`});
-        }
-      );
-
-      const vacuum=async()=>{
-        try{
-          const r=await adminFetch('/admin/vacuum',{method:'POST'});
-          if(!r.ok) throw new Error('Vacuum failed');
-          onFlash({kind:'ok',text:'Database vacuumed'});
-        }catch(e){ onFlash({kind:'err',text:e.message}); }
-      };
-
-      const exportAll=(fmt)=>async()=>{
-        try{ await adminDownload(fmt); onFlash({kind:'ok',text:`Exported as ${fmt.toUpperCase()}`}); }
-        catch(e){ onFlash({kind:'err',text:e.message}); }
-      };
-
-      const btn={padding:'6px 12px',borderRadius:6,border:'1px solid #334155',
-        background:'#0f172a',color:'#cbd5e1',fontSize:12,cursor:'pointer',fontWeight:500};
-      const btnDanger={...btn,border:'1px solid #7f1d1d',color:'#fca5a5',background:'#1a0a0a'};
-      const btnDisabled={...btn,opacity:0.4,cursor:'not-allowed'};
-
-      return (
-        <div style={{background:'#1a1530',border:'1px solid #3b2e66',borderRadius:8,
-          padding:'12px 16px',margin:'0 20px',marginTop:12,flexShrink:0}}>
-          <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:10}}>
-            <span style={{fontSize:12,fontWeight:700,color:'#c4b5fd',letterSpacing:'0.05em'}}>
-              🔓 ADMIN PANEL
-            </span>
-            {flash&&<span style={{fontSize:11,padding:'2px 10px',borderRadius:4,
-              background:flash.kind==='ok'?'#052e1a':'#450a0a',
-              color:flash.kind==='ok'?'#6ee7b7':'#fca5a5',
-              border:`1px solid ${flash.kind==='ok'?'#065f46':'#7f1d1d'}`}}>
-              {flash.text}
-            </span>}
-          </div>
-
-          <div style={{display:'flex',gap:16,flexWrap:'wrap',alignItems:'center'}}>
-            <div style={{display:'flex',alignItems:'center',gap:6}}>
-              <span style={{fontSize:11,color:'#94a3b8'}}>Alert threshold:</span>
-              <input type="number" min="0" max="100" value={localThreshold}
-                onChange={e=>setLocalThreshold(e.target.value)}
-                style={{width:60,padding:'4px 8px',borderRadius:4,border:'1px solid #334155',
-                  background:'#0f172a',color:'#e2e8f0',fontSize:12}}/>
-              <button onClick={saveThreshold} style={btn}>Save</button>
-            </div>
-
-            <span style={{color:'#334155'}}>|</span>
-
-            <button onClick={clearAll} style={btnDanger}>Clear ALL events</button>
-            <button onClick={selectedClient?clearClientEvents:undefined}
-              style={selectedClient?btnDanger:btnDisabled}
-              title={selectedClient?'':'Select a client first'}>
-              Clear events for selected
-            </button>
-            <button onClick={selectedClient?deleteClient:undefined}
-              style={selectedClient?btnDanger:btnDisabled}
-              title={selectedClient?'':'Select a client first'}>
-              Delete selected client
-            </button>
-
-            <span style={{color:'#334155'}}>|</span>
-
-            <button onClick={vacuum} style={btn}>Vacuum DB</button>
-            <button onClick={exportAll('csv')} style={btn}>Export all (CSV)</button>
-            <button onClick={exportAll('json')} style={btn}>Export all (JSON)</button>
-          </div>
-        </div>
-      );
+        const [localThreshold,setLocalThreshold]=useState(threshold); useEffect(()=>{setLocalThreshold(threshold);},[threshold]);
+        useEffect(()=>{ (async()=>{ try{ const r=await adminFetch('/admin/config'); if(r.ok){ const cfg=await r.json(); onThreshold(cfg.alert_threshold); setLocalThreshold(cfg.alert_threshold); } }catch{} })(); },[]);
+        const confirmAnd=(msg,fn)=>async()=>{ if(!window.confirm(msg)) return; try{ await fn(); } catch(e){ onFlash({kind:'err',text:e.message||'Action failed'}); } };
+        const saveThreshold=async()=>{ const n=parseInt(localThreshold,10); if(isNaN(n)||n<0||n>100){ onFlash({kind:'err',text:'Threshold must be 0–100'}); return; } const r=await adminFetch('/admin/config',{method:'PUT',body:JSON.stringify({alert_threshold:n})}); if(!r.ok){ onFlash({kind:'err',text:'Failed to update threshold'}); return; } onThreshold(n); onFlash({kind:'ok',text:`Alert threshold set to ${n}`}); };
+        const clearAll=confirmAnd('Delete ALL events from the database? This cannot be undone.',async()=>{ const r=await adminFetch('/admin/events',{method:'DELETE'}); if(!r.ok) throw new Error('Delete failed'); const {deleted}=await r.json(); onFlash({kind:'ok',text:`Deleted ${deleted} events`}); });
+        const clearClientEvents=confirmAnd( selectedClient?`Delete all events for ${selectedClient.hostname}?`:'', async()=>{ const r=await adminFetch(`/admin/events?client_id=${encodeURIComponent(selectedClient.client_id)}`,{method:'DELETE'}); if(!r.ok) throw new Error('Delete failed'); const {deleted}=await r.json(); onFlash({kind:'ok',text:`Deleted ${deleted} events for ${selectedClient.hostname}`}); } );
+        const deleteClient=confirmAnd( selectedClient?`Delete client ${selectedClient.hostname} AND all its events?`:'', async()=>{ const r=await adminFetch(`/admin/clients/${encodeURIComponent(selectedClient.client_id)}`,{method:'DELETE'}); if(!r.ok) throw new Error('Delete failed'); onFlash({kind:'ok',text:`Removed client ${selectedClient.hostname}`}); } );
+        const vacuum=async()=>{ try{ const r=await adminFetch('/admin/vacuum',{method:'POST'}); if(!r.ok) throw new Error('Vacuum failed'); onFlash({kind:'ok',text:'Database vacuumed'}); }catch(e){ onFlash({kind:'err',text:e.message}); } };
+        const exportAll=(fmt)=>async()=>{ try{ await adminDownload(fmt); onFlash({kind:'ok',text:`Exported as ${fmt.toUpperCase()}`}); } catch(e){ onFlash({kind:'err',text:e.message}); } };
+        const btn={padding:'6px 12px',borderRadius:6,border:'1px solid #334155', background:'#0f172a',color:'#cbd5e1',fontSize:12,cursor:'pointer',fontWeight:500}; const btnDanger={...btn,border:'1px solid #7f1d1d',color:'#fca5a5',background:'#1a0a0a'}; const btnDisabled={...btn,opacity:0.4,cursor:'not-allowed'};
+        return ( <div style={{background:'#1a1530',border:'1px solid #3b2e66',borderRadius:8, padding:'12px 16px',margin:'0 20px',marginTop:12,flexShrink:0}}> <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:10}}> <span style={{fontSize:12,fontWeight:700,color:'#c4b5fd',letterSpacing:'0.05em'}}> 🔓 ADMIN PANEL </span> {flash&&<span style={{fontSize:11,padding:'2px 10px',borderRadius:4, background:flash.kind==='ok'?'#052e1a':'#450a0a', color:flash.kind==='ok'?'#6ee7b7':'#fca5a5', border:`1px solid ${flash.kind==='ok'?'#065f46':'#7f1d1d'}`}}> {flash.text} </span>} </div> <div style={{display:'flex',gap:16,flexWrap:'wrap',alignItems:'center'}}> <div style={{display:'flex',alignItems:'center',gap:6}}> <span style={{fontSize:11,color:'#94a3b8'}}>Alert threshold:</span> <input type="number" min="0" max="100" value={localThreshold} onChange={e=>setLocalThreshold(e.target.value)} style={{width:60,padding:'4px 8px',borderRadius:4,border:'1px solid #334155', background:'#0f172a',color:'#e2e8f0',fontSize:12}}/> <button onClick={saveThreshold} style={btn}>Save</button> </div> <span style={{color:'#334155'}}>|</span> <button onClick={clearAll} style={btnDanger}>Clear ALL events</button> <button onClick={selectedClient?clearClientEvents:undefined} style={selectedClient?btnDanger:btnDisabled} title={selectedClient?'':'Select a client first'}> Clear events for selected </button> <button onClick={selectedClient?deleteClient:undefined} style={selectedClient?btnDanger:btnDisabled} title={selectedClient?'':'Select a client first'}> Delete selected client </button> <span style={{color:'#334155'}}>|</span> <button onClick={vacuum} style={btn}>Vacuum DB</button> <button onClick={exportAll('csv')} style={btn}>Export all (CSV)</button> <button onClick={exportAll('json')} style={btn}>Export all (JSON)</button> </div> </div> );
     }
 
     function StatCard({label,value,accent}){
       return (
-        <div style={{background:'#1e293b',border:'1px solid #334155',borderRadius:10,
-          padding:'14px 20px',flex:1,minWidth:120}}>
+        <div style={{background:'#1e293b',border:'1px solid #334155',borderRadius:10, padding:'14px 20px',flex:1,minWidth:120}}>
           <div style={{fontSize:28,fontWeight:800,color:accent||'#f1f5f9',lineHeight:1}}>{value}</div>
           <div style={{fontSize:12,color:'#94a3b8',marginTop:4,fontWeight:500}}>{label}</div>
         </div>
       );
     }
-
     function StatCards({stats}){
       return (
         <div style={{display:'flex',gap:12,padding:'16px 20px 0',flexShrink:0,flexWrap:'wrap'}}>
@@ -547,36 +413,18 @@
 
     function ClientSidebar({clients,selected,onSelect}){
       return (
-        <div style={{width:230,flexShrink:0,background:'#0f172a',
-          borderRight:'1px solid #1e293b',overflowY:'auto',display:'flex',flexDirection:'column'}}>
-          <div style={{padding:'12px 16px 8px',fontSize:11,fontWeight:700,color:'#475569',
-            letterSpacing:'0.08em',textTransform:'uppercase',borderBottom:'1px solid #1e293b'}}>
-            Endpoints ({clients.length})
-          </div>
-          {clients.length===0&&(
-            <div style={{padding:'24px 16px',color:'#334155',fontSize:13,textAlign:'center'}}>
-              <div style={{fontSize:24,marginBottom:8}}>🖥</div>
-              No agents connected
-            </div>
-          )}
+        <div style={{width:230,flexShrink:0,background:'#0f172a', borderRight:'1px solid #1e293b',overflowY:'auto',display:'flex',flexDirection:'column'}}>
+          <div style={{padding:'12px 16px 8px',fontSize:11,fontWeight:700,color:'#475569', letterSpacing:'0.08em',textTransform:'uppercase',borderBottom:'1px solid #1e293b'}}> Endpoints ({clients.length}) </div>
+          {clients.length===0&&( <div style={{padding:'24px 16px',color:'#334155',fontSize:13,textAlign:'center'}}> <div style={{fontSize:24,marginBottom:8}}>🖥</div> No agents connected </div> )}
           {clients.map(c=>{
             const sel=selected?.client_id===c.client_id;
             const lvl=lvlOf(c.max_risk_score);
             return (
-              <div key={c.client_id} onClick={()=>onSelect(sel?null:c)} style={{
-                padding:'10px 14px',cursor:'pointer',transition:'background 0.1s',
-                background:sel?'#1e293b':'transparent',
-                borderLeft:`3px solid ${sel?RISK[lvl].dot:'transparent'}`,
-              }}>
-                <div style={{fontSize:13,fontWeight:600,color:'#e2e8f0',
-                  overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
-                  {c.hostname}
-                </div>
+              <div key={c.client_id} onClick={()=>onSelect(sel?null:c)} style={{ padding:'10px 14px',cursor:'pointer',transition:'background 0.1s', background:sel?'#1e293b':'transparent', borderLeft:`3px solid ${sel?RISK[lvl].dot:'transparent'}`, }}>
+                <div style={{fontSize:13,fontWeight:600,color:'#e2e8f0', overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}> {c.hostname} </div>
                 <div style={{marginTop:4}}><RiskBadge level={lvl} score={c.max_risk_score}/></div>
                 <div style={{fontSize:11,color:'#475569',marginTop:3}}>{c.ip}</div>
-                <div style={{fontSize:10,color:'#334155',marginTop:1}}>
-                  {fmtTime(c.last_seen)}
-                </div>
+                <div style={{fontSize:10,color:'#334155',marginTop:1}}> {fmtTime(c.last_seen)} </div>
               </div>
             );
           })}
@@ -586,81 +434,43 @@
 
     function FilterBar({filter,onChange}){
       return (
-        <div style={{display:'flex',gap:8,padding:'12px 20px',
-          flexShrink:0,alignItems:'center',flex:1}}>
+        <div style={{display:'flex',gap:8,padding:'12px 20px', flexShrink:0,alignItems:'center',flex:1}}>
           <span style={{fontSize:12,color:'#475569',marginRight:4}}>Filter:</span>
           {['ALL','HIGH','MED','LOW'].map(opt=>{
-            const active=filter===opt;
-            const color=opt!=='ALL'?RISK[opt]?.dot:'#60a5fa';
-            return (
-              <button key={opt} onClick={()=>onChange(opt)} style={{
-                padding:'4px 14px',borderRadius:9999,cursor:'pointer',fontSize:13,
-                border:active?`1.5px solid ${color}`:'1.5px solid #334155',
-                background:active?'#1e293b':'transparent',
-                color:active?color:'#94a3b8',fontWeight:active?700:500,
-              }}>{opt}</button>
-            );
+            const active=filter===opt; const color=opt!=='ALL'?RISK[opt]?.dot:'#60a5fa';
+            return ( <button key={opt} onClick={()=>onChange(opt)} style={{ padding:'4px 14px',borderRadius:9999,cursor:'pointer',fontSize:13, border:active?`1.5px solid ${color}`:'1.5px solid #334155', background:active?'#1e293b':'transparent', color:active?color:'#94a3b8',fontWeight:active?700:500, }}>{opt}</button> );
           })}
         </div>
       );
     }
 
     function ClientDetail({client,onClear}){
-      if(!client) return null;
-      const lvl=lvlOf(client.max_risk_score);
+      if(!client) return null; const lvl=lvlOf(client.max_risk_score);
       return (
-        <div style={{background:'#1e293b',borderBottom:'1px solid #334155',
-          padding:'12px 20px',display:'flex',alignItems:'center',gap:16,flexShrink:0}}>
+        <div style={{background:'#1e293b',borderBottom:'1px solid #334155', padding:'12px 20px',display:'flex',alignItems:'center',gap:16,flexShrink:0}}>
           <div style={{flex:1}}>
-            <div style={{display:'flex',alignItems:'center',gap:10,flexWrap:'wrap'}}>
-              <span style={{fontSize:15,fontWeight:700,color:'#f1f5f9'}}>{client.hostname}</span>
-              <RiskBadge level={lvl} score={client.max_risk_score}/>
-            </div>
-            <div style={{marginTop:3,fontSize:12,color:'#64748b'}}>
-              {client.ip} · Last seen: {fmtTime(client.last_seen)}
-            </div>
+            <div style={{display:'flex',alignItems:'center',gap:10,flexWrap:'wrap'}}> <span style={{fontSize:15,fontWeight:700,color:'#f1f5f9'}}>{client.hostname}</span> <RiskBadge level={lvl} score={client.max_risk_score}/> </div>
+            <div style={{marginTop:3,fontSize:12,color:'#64748b'}}> {client.ip} · Last seen: {fmtTime(client.last_seen)} </div>
           </div>
-          <button onClick={onClear} style={{background:'transparent',border:'1px solid #334155',
-            color:'#94a3b8',borderRadius:6,padding:'4px 12px',fontSize:13,cursor:'pointer'}}>
-            Clear
-          </button>
+          <button onClick={onClear} style={{background:'transparent',border:'1px solid #334155', color:'#94a3b8',borderRadius:6,padding:'4px 12px',fontSize:13,cursor:'pointer'}}> Clear </button>
         </div>
       );
     }
 
     function EventCard({ev,onClick}){
-      const lvl=ev.risk_level||'LOW';
-      const s=RISK[lvl]||RISK.LOW;
+      const lvl=ev.risk_level||'LOW'; const s=RISK[lvl]||RISK.LOW;
       return (
-        <div onClick={onClick} style={{background:'#1e293b',border:'1px solid #334155',
-          borderLeft:`3px solid ${s.dot}`,borderRadius:8,cursor:'pointer',
-          padding:'10px 14px',display:'flex',gap:12,alignItems:'flex-start',
-          transition:'background 0.1s'}}
-          onMouseEnter={e=>e.currentTarget.style.background='#253348'}
-          onMouseLeave={e=>e.currentTarget.style.background='#1e293b'}>
-          <div style={{paddingTop:1,flexShrink:0}}>
-            <RiskBadge level={lvl} score={ev.risk_score}/>
-          </div>
+        <div onClick={onClick} style={{background:'#1e293b',border:'1px solid #334155', borderLeft:`3px solid ${s.dot}`,borderRadius:8,cursor:'pointer', padding:'10px 14px',display:'flex',gap:12,alignItems:'flex-start', transition:'background 0.1s'}} onMouseEnter={e=>e.currentTarget.style.background='#253348'} onMouseLeave={e=>e.currentTarget.style.background='#1e293b'}>
+          <div style={{paddingTop:1,flexShrink:0}}> <RiskBadge level={lvl} score={ev.risk_score}/> </div>
           <div style={{flex:1,minWidth:0}}>
             <div style={{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap',marginBottom:3}}>
-              <span style={{fontSize:11,fontWeight:700,color:'#fff',
-                background:TYPE_COLOR[ev.event_type]||'#334155',
-                borderRadius:4,padding:'1px 7px',letterSpacing:'0.04em'}}>
-                {ev.event_type}
-              </span>
+              <span style={{fontSize:11,fontWeight:700,color:'#fff', background:TYPE_COLOR[ev.event_type]||'#334155', borderRadius:4,padding:'1px 7px',letterSpacing:'0.04em'}}> {ev.event_type} </span>
               <span style={{fontSize:13,fontWeight:600,color:'#cbd5e1'}}>{ev.hostname}</span>
-              {ev.after_hours&&(
-                <span style={{fontSize:11,color:'#a78bfa',fontWeight:600}}>after-hours</span>
-              )}
+              {ev.after_hours&&( <span style={{fontSize:11,color:'#a78bfa',fontWeight:600}}>after-hours</span> )}
             </div>
-            <div style={{fontSize:13,color:'#94a3b8',overflow:'hidden',
-              textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
-              {summary(ev)}
-            </div>
+            <div style={{fontSize:13,color:'#94a3b8',overflow:'hidden', textOverflow:'ellipsis',whiteSpace:'nowrap'}}> {summary(ev)} </div>
           </div>
-          <div title={fmtTime(ev.timestamp)} style={{fontSize:11,color:'#475569',whiteSpace:'nowrap',paddingTop:2,flexShrink:0}}>
-            {relativeTime(ev.timestamp)}
-          </div>
+          <div title={fmtTime(ev.timestamp)} style={{fontSize:11,color:'#475569',whiteSpace:'nowrap',paddingTop:2,flexShrink:0}}> {relativeTime(ev.timestamp)} </div>
         </div>
       );
     }
@@ -668,12 +478,7 @@
     function SearchBar({query,onChange}){
       return (
         <div style={{padding:'8px 20px 0',flexShrink:0}}>
-          <input type="text" value={query} onChange={e=>onChange(e.target.value)}
-            placeholder="Search events by hostname, type, or content..."
-            style={{width:'100%',padding:'8px 14px',borderRadius:8,border:'1px solid #334155',
-              background:'#0f172a',color:'#e2e8f0',fontSize:13,outline:'none',
-              fontFamily:"'Segoe UI',system-ui,sans-serif"}}
-          />
+          <input type="text" value={query} onChange={e=>onChange(e.target.value)} placeholder="Search events by hostname, type, or content..." style={{width:'100%',padding:'8px 14px',borderRadius:8,border:'1px solid #334155', background:'#0f172a',color:'#e2e8f0',fontSize:13,outline:'none', fontFamily:"'Segoe UI',system-ui,sans-serif"}} />
         </div>
       );
     }
@@ -682,57 +487,29 @@
       if(events.length===0) return null;
       return (
         <div style={{display:'flex',gap:6,padding:'0 20px',flexShrink:0}}>
-          <button onClick={()=>exportData(events,'csv')} style={{padding:'4px 12px',borderRadius:6,
-            border:'1px solid #334155',background:'transparent',color:'#94a3b8',fontSize:12,
-            cursor:'pointer',fontWeight:500}}>Export CSV</button>
-          <button onClick={()=>exportData(events,'json')} style={{padding:'4px 12px',borderRadius:6,
-            border:'1px solid #334155',background:'transparent',color:'#94a3b8',fontSize:12,
-            cursor:'pointer',fontWeight:500}}>Export JSON</button>
+          <button onClick={()=>exportData(events,'csv')} style={{padding:'4px 12px',borderRadius:6, border:'1px solid #334155',background:'transparent',color:'#94a3b8',fontSize:12, cursor:'pointer',fontWeight:500}}>Export CSV</button>
+          <button onClick={()=>exportData(events,'json')} style={{padding:'4px 12px',borderRadius:6, border:'1px solid #334155',background:'transparent',color:'#94a3b8',fontSize:12, cursor:'pointer',fontWeight:500}}>Export JSON</button>
         </div>
       );
     }
 
     function EventModal({ev,onClose}){
-      if(!ev) return null;
-      const lvl=ev.risk_level||'LOW';
-      const s=RISK[lvl]||RISK.LOW;
-      const data=parseData(ev);
+      if(!ev) return null; const lvl=ev.risk_level||'LOW'; const s=RISK[lvl]||RISK.LOW; const data=parseData(ev);
       return (
-        <div onClick={onClose} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.6)',
-          display:'flex',alignItems:'center',justifyContent:'center',zIndex:1000}}>
-          <div onClick={e=>e.stopPropagation()} style={{background:'#1e293b',border:'1px solid #334155',
-            borderRadius:12,padding:24,maxWidth:560,width:'90%',maxHeight:'80vh',overflowY:'auto',
-            color:'#e2e8f0'}}>
+        <div onClick={onClose} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.6)', display:'flex',alignItems:'center',justifyContent:'center',zIndex:1000}}>
+          <div onClick={e=>e.stopPropagation()} style={{background:'#1e293b',border:'1px solid #334155', borderRadius:12,padding:24,maxWidth:560,width:'90%',maxHeight:'80vh',overflowY:'auto', color:'#e2e8f0'}}>
             <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
-              <div style={{display:'flex',alignItems:'center',gap:10}}>
-                <RiskBadge level={lvl} score={ev.risk_score}/>
-                <span style={{fontSize:11,fontWeight:700,color:'#fff',
-                  background:TYPE_COLOR[ev.event_type]||'#334155',
-                  borderRadius:4,padding:'1px 7px'}}>{ev.event_type}</span>
-              </div>
-              <button onClick={onClose} style={{background:'transparent',border:'none',color:'#94a3b8',
-                fontSize:20,cursor:'pointer',lineHeight:1}}>×</button>
+              <div style={{display:'flex',alignItems:'center',gap:10}}> <RiskBadge level={lvl} score={ev.risk_score}/> <span style={{fontSize:11,fontWeight:700,color:'#fff', background:TYPE_COLOR[ev.event_type]||'#334155', borderRadius:4,padding:'1px 7px'}}>{ev.event_type}</span> </div>
+              <button onClick={onClose} style={{background:'transparent',border:'none',color:'#94a3b8', fontSize:20,cursor:'pointer',lineHeight:1}}>×</button>
             </div>
             <div style={{display:'grid',gridTemplateColumns:'auto 1fr',gap:'8px 16px',fontSize:13}}>
-              <span style={{color:'#64748b',fontWeight:600}}>Hostname</span>
-                <span>{ev.hostname}</span>
-              <span style={{color:'#64748b',fontWeight:600}}>Client ID</span>
-                <span style={{fontFamily:'monospace',fontSize:12}}>{ev.client_id}</span>
-              <span style={{color:'#64748b',fontWeight:600}}>Timestamp</span>
-                <span>{new Date(ev.timestamp).toLocaleString()}</span>
-              <span style={{color:'#64748b',fontWeight:600}}>After Hours</span>
-                <span>{ev.after_hours?'Yes':'No'}</span>
-              <span style={{color:'#64748b',fontWeight:600}}>Summary</span>
-                <span>{summary(ev)}</span>
+              <span style={{color:'#64748b',fontWeight:600}}>Hostname</span> <span>{ev.hostname}</span>
+              <span style={{color:'#64748b',fontWeight:600}}>Client ID</span> <span style={{fontFamily:'monospace',fontSize:12}}>{ev.client_id}</span>
+              <span style={{color:'#64748b',fontWeight:600}}>Timestamp</span> <span>{new Date(ev.timestamp).toLocaleString()}</span>
+              <span style={{color:'#64748b',fontWeight:600}}>After Hours</span> <span>{ev.after_hours?'Yes':'No'}</span>
+              <span style={{color:'#64748b',fontWeight:600}}>Summary</span> <span>{summary(ev)}</span>
             </div>
-            <div style={{marginTop:16}}>
-              <div style={{fontSize:12,fontWeight:600,color:'#64748b',marginBottom:6}}>Raw Event Data</div>
-              <pre style={{background:'#0f172a',border:'1px solid #334155',borderRadius:8,
-                padding:12,fontSize:12,color:'#94a3b8',overflowX:'auto',margin:0,
-                fontFamily:'Consolas,monospace',whiteSpace:'pre-wrap',wordBreak:'break-word'}}>
-                {JSON.stringify(data,null,2)}
-              </pre>
-            </div>
+            <div style={{marginTop:16}}> <div style={{fontSize:12,fontWeight:600,color:'#64748b',marginBottom:6}}>Raw Event Data</div> <pre style={{background:'#0f172a',border:'1px solid #334155',borderRadius:8, padding:12,fontSize:12,color:'#94a3b8',overflowX:'auto',margin:0, fontFamily:'Consolas,monospace',whiteSpace:'pre-wrap',wordBreak:'break-word'}}> {JSON.stringify(data,null,2)} </pre> </div>
           </div>
         </div>
       );
@@ -743,27 +520,13 @@
       const filtered=events.filter(e=>{
         if(filter!=='ALL'&&e.risk_level!==filter) return false;
         if(selected&&e.client_id!==selected.client_id) return false;
-        if(q){
-          const haystack=(e.hostname+' '+e.event_type+' '+summary(e)+' '+e.client_id).toLowerCase();
-          if(!haystack.includes(q)) return false;
-        }
+        if(q){ const haystack=(e.hostname+' '+e.event_type+' '+summary(e)+' '+e.client_id).toLowerCase(); if(!haystack.includes(q)) return false; }
         return true;
       });
       if(filtered.length===0){
-        return (
-          <div style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',
-            justifyContent:'center',color:'#334155',gap:12}}>
-            <div style={{fontSize:40}}>📭</div>
-            <div style={{fontSize:14}}>No events match the current filter</div>
-          </div>
-        );
+        return ( <div style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center', justifyContent:'center',color:'#334155',gap:12}}> <div style={{fontSize:40}}>📭</div> <div style={{fontSize:14}}>No events match the current filter</div> </div> );
       }
-      return (
-        <div style={{flex:1,overflowY:'auto',padding:'12px 20px',
-          display:'flex',flexDirection:'column',gap:8}}>
-          {filtered.map(ev=><EventCard key={ev.id} ev={ev} onClick={()=>onSelectEvent(ev)}/>)}
-        </div>
-      );
+      return ( <div style={{flex:1,overflowY:'auto',padding:'12px 20px', display:'flex',flexDirection:'column',gap:8}}> {filtered.map(ev=><EventCard key={ev.id} ev={ev} onClick={()=>onSelectEvent(ev)}/>)} </div> );
     }
 
     // -------------------------------------------------------------------------
@@ -772,6 +535,7 @@
     function App(){
       const [state,dispatch]=useReducer(reducer,initialState);
       const lastIdRef=useRef(0);
+      const [dragOver, setDragOver] = useState(false);
 
       const poll=useCallback(async()=>{
         try{
@@ -788,74 +552,125 @@
           dispatch({type:'SET_CLIENTS',payload:clients});
           dispatch({type:'SET_STATS',payload:stats});
           dispatch({type:'SET_ERROR',payload:null});
-        }catch(e){
-          dispatch({type:'SET_ERROR',payload:'Cannot reach server'});
-        }
+        }catch(e){ dispatch({type:'SET_ERROR',payload:'Cannot reach server'}); }
       },[]);
 
       // Live polling
       useEffect(()=>{
-        if(state.demoMode) return;
+        if(state.demoMode || state.isHistorical) return;
         poll();
         const id=setInterval(poll,POLL_INTERVAL);
         return ()=>clearInterval(id);
-      },[state.demoMode,poll]);
+      },[state.demoMode, state.isHistorical, poll]);
 
-      // Demo ticker - High Volume simulation
+      // Demo ticker
       useEffect(()=>{
-        if(!state.demoMode) return;
+        if(!state.demoMode || state.isHistorical) return;
         const id=setInterval(() => {
-          // Generate 1 to 4 events rapidly per tick
           const batchSize = 1 + Math.floor(Math.random() * 4);
           const evs = Array.from({length: batchSize}, genDemoEvent);
           dispatch({type:'PREPEND',payload:evs});
         }, 1200);
         return ()=>clearInterval(id);
-      },[state.demoMode]);
+      },[state.demoMode, state.isHistorical]);
 
       // Derive demo clients/stats from events
       useEffect(()=>{
-        if(!state.demoMode) return;
-        const clients = buildDemoClients(state.events);
+        if(!state.demoMode || state.isHistorical) return;
+        const clients = buildClientsFromEvents(state.events, true);
         dispatch({type:'SET_CLIENTS',payload:clients});
-        const h=state.events.filter(e=>e.risk_level==='HIGH').length;
-        const m=state.events.filter(e=>e.risk_level==='MED').length;
-        const l=state.events.filter(e=>e.risk_level==='LOW').length;
-        dispatch({type:'SET_STATS',payload:{total:state.events.length,high:h,med:m,low:l,active_clients:clients.length}});
-      },[state.events,state.demoMode]);
+        dispatch({type:'SET_STATS',payload: calcStats(state.events, clients.length)});
+      },[state.events, state.demoMode, state.isHistorical]);
 
+      // ---------------------------------------------------------------------------
+      // Daily Auto-Save and Clear (Server-Side Archiving)
+      // ---------------------------------------------------------------------------
+      const currentDayRef = useRef(new Date().getDate());
+      useEffect(() => {
+        if(state.isHistorical) return; 
+
+        const timerId = setInterval(() => {
+          const today = new Date().getDate();
+          
+          if (today !== currentDayRef.current) {
+            console.log("[Auto-Save] Midnight reached. Archiving to server folder...");
+            
+            if (state.events.length > 0) {
+              fetch(`${API_BASE}/archive`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ events: state.events })
+              })
+              .then(res => {
+                  if(!res.ok) throw new Error("Server rejected archive payload");
+                  console.log("Successfully saved log to project 'archives' folder.");
+              })
+              .catch(err => {
+                  console.error("Server save failed. Falling back to browser download.", err);
+                  exportData(state.events, 'json'); 
+              });
+            }
+            
+            dispatch({ type: 'CLEAR_EVENTS' });
+            lastIdRef.current = 0; 
+            currentDayRef.current = today;
+          }
+        }, 60000); 
+
+        return () => clearInterval(timerId);
+      }, [state.events, state.isHistorical]);
+
+      // Handlers
       const handleToggleDemo=useCallback(()=>{lastIdRef.current=0;dispatch({type:'TOGGLE_DEMO'});},[]);
-
-      // Admin handlers
       const handleAdminClick=useCallback(()=>dispatch({type:'SET_ADMIN_MODAL',payload:true}),[]);
       const handleAdminClose=useCallback(()=>dispatch({type:'SET_ADMIN_MODAL',payload:false}),[]);
-      const handleAdminSuccess=useCallback((token)=>{
-        dispatch({type:'SET_ADMIN_TOKEN',payload:token});
-        dispatch({type:'SET_ADMIN_MODAL',payload:false});
-        dispatch({type:'SET_ADMIN_FLASH',payload:{kind:'ok',text:'Admin mode unlocked'}});
-      },[]);
-      const handleAdminLogout=useCallback(async()=>{
-        try{ await adminFetch('/admin/logout',{method:'POST'}); }catch{}
-        sessionStorage.removeItem('adminToken');
-        dispatch({type:'SET_ADMIN_TOKEN',payload:null});
-        dispatch({type:'SET_ADMIN_FLASH',payload:null});
-      },[]);
-      const handleAdminFlash=useCallback((f)=>{
-        dispatch({type:'SET_ADMIN_FLASH',payload:f});
-        if(f) setTimeout(()=>dispatch({type:'SET_ADMIN_FLASH',payload:null}),4000);
-      },[]);
+      const handleAdminSuccess=useCallback((token)=>{ dispatch({type:'SET_ADMIN_TOKEN',payload:token}); dispatch({type:'SET_ADMIN_MODAL',payload:false}); dispatch({type:'SET_ADMIN_FLASH',payload:{kind:'ok',text:'Admin mode unlocked'}}); },[]);
+      const handleAdminLogout=useCallback(async()=>{ try{ await adminFetch('/admin/logout',{method:'POST'}); }catch{} sessionStorage.removeItem('adminToken'); dispatch({type:'SET_ADMIN_TOKEN',payload:null}); dispatch({type:'SET_ADMIN_FLASH',payload:null}); },[]);
+      const handleAdminFlash=useCallback((f)=>{ dispatch({type:'SET_ADMIN_FLASH',payload:f}); if(f) setTimeout(()=>dispatch({type:'SET_ADMIN_FLASH',payload:null}),4000); },[]);
       const handleSetThreshold=useCallback((n)=>dispatch({type:'SET_ADMIN_THRESHOLD',payload:n}),[]);
+
+      const handleExitHistorical = useCallback(() => {
+        lastIdRef.current = 0;
+        dispatch({type:'EXIT_HISTORICAL'});
+      }, []);
+
+      const processFile = (file) => {
+        if(!file) return;
+        const reader = new FileReader();
+        reader.onload = (evt) => {
+            try {
+                const data = JSON.parse(evt.target.result);
+                if(!Array.isArray(data)) throw new Error("JSON must be an array of events");
+                dispatch({ type: 'LOAD_HISTORICAL', payload: { events: data, filename: file.name }});
+            } catch(err) {
+                alert("Failed to parse historical JSON file.");
+            }
+        };
+        reader.readAsText(file);
+      };
+
+      const handleFileUpload = (e) => {
+          processFile(e.target.files[0]);
+          e.target.value = null; 
+      };
+
+      const onDragOver = (e) => { e.preventDefault(); setDragOver(true); };
+      const onDragLeave = (e) => { e.preventDefault(); setDragOver(false); };
+      const onDrop = (e) => {
+          e.preventDefault();
+          setDragOver(false);
+          const file = e.dataTransfer.files[0];
+          if(file && file.name.endsWith('.json')){
+              processFile(file);
+          } else {
+              alert("Please drop a valid .json log file.");
+          }
+      };
 
       useEffect(()=>{
         const saved=sessionStorage.getItem('adminToken');
         if(!saved) return;
-        (async()=>{
-          const ok=await adminCheck();
-          if(!ok){
-            sessionStorage.removeItem('adminToken');
-            dispatch({type:'SET_ADMIN_TOKEN',payload:null});
-          }
-        })();
+        (async()=>{ const ok=await adminCheck(); if(!ok){ sessionStorage.removeItem('adminToken'); dispatch({type:'SET_ADMIN_TOKEN',payload:null}); } })();
       },[]);
 
       useEffect(()=>{
@@ -866,68 +681,55 @@
 
       const prevCountRef=useRef(0);
       useEffect(()=>{
+        if (state.isHistorical) return; 
         const highEvents=state.events.filter(e=>e.risk_level==='HIGH');
         if(highEvents.length>prevCountRef.current&&prevCountRef.current>0){
           const newHighs=highEvents.slice(0,highEvents.length-prevCountRef.current);
           newHighs.forEach(notifyHigh);
         }
         prevCountRef.current=highEvents.length;
-      },[state.events]);
+      },[state.events, state.isHistorical]);
 
       return (
-        <div style={{display:'flex',flexDirection:'column',height:'100vh',
-          background:'#0f172a',color:'#f1f5f9',
-          fontFamily:"'Segoe UI',system-ui,sans-serif",overflow:'hidden'}}>
+        <div 
+          onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop}
+          style={{display:'flex',flexDirection:'column',height:'100vh', background:'#0f172a',color:'#f1f5f9', fontFamily:"'Segoe UI',system-ui,sans-serif",overflow:'hidden', position: 'relative'}}
+        >
+          {dragOver && (
+            <div style={{position:'absolute', inset:0, background:'rgba(56, 189, 248, 0.15)', zIndex:9999, display:'flex', alignItems:'center', justifyContent:'center', border:'4px dashed #38bdf8', pointerEvents:'none'}}>
+                <h1 style={{color:'#f8fafc', fontSize: 32, textShadow:'0 2px 10px rgba(0,0,0,0.5)'}}>Drop Historical JSON Log Here</h1>
+            </div>
+          )}
 
-          <TopBar demoMode={state.demoMode} onToggle={handleToggleDemo} error={state.error}
-            adminToken={state.adminToken}
-            onAdminClick={handleAdminClick}
-            onAdminLogout={handleAdminLogout}/>
+          <TopBar 
+            state={state} 
+            onToggleDemo={handleToggleDemo} 
+            onExitHistorical={handleExitHistorical}
+            onFileUpload={handleFileUpload}
+            onAdminClick={handleAdminClick} 
+            onAdminLogout={handleAdminLogout}
+          />
           <StatCards stats={state.stats}/>
 
-          {state.adminToken&&!state.demoMode&&(
-            <AdminPanel
-              selectedClient={state.selectedClient}
-              flash={state.adminFlash}
-              onFlash={handleAdminFlash}
-              onLogout={handleAdminLogout}
-              threshold={state.adminThreshold}
-              onThreshold={handleSetThreshold}
-            />
+          {state.adminToken&&!state.demoMode&&!state.isHistorical&&(
+            <AdminPanel selectedClient={state.selectedClient} flash={state.adminFlash} onFlash={handleAdminFlash} onLogout={handleAdminLogout} threshold={state.adminThreshold} onThreshold={handleSetThreshold} />
           )}
 
           <div style={{display:'flex',flex:1,overflow:'hidden',marginTop:16}}>
-            <ClientSidebar
-              clients={state.clients}
-              selected={state.selectedClient}
-              onSelect={c=>dispatch({type:'SELECT',payload:c})}
-            />
+            <ClientSidebar clients={state.clients} selected={state.selectedClient} onSelect={c=>dispatch({type:'SELECT',payload:c})} />
             <div style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden'}}>
               <div style={{display:'flex',alignItems:'center',gap:0,borderBottom:'1px solid #1e293b',flexShrink:0}}>
                 <FilterBar filter={state.filter} onChange={f=>dispatch({type:'SET_FILTER',payload:f})}/>
                 <ExportButtons events={state.events}/>
               </div>
               <SearchBar query={state.searchQuery} onChange={q=>dispatch({type:'SET_SEARCH',payload:q})}/>
-              <ClientDetail
-                client={state.selectedClient}
-                onClear={()=>dispatch({type:'SELECT',payload:null})}
-              />
-              <EventFeed
-                events={state.events}
-                filter={state.filter}
-                selected={state.selectedClient}
-                searchQuery={state.searchQuery}
-                onSelectEvent={ev=>dispatch({type:'SET_SELECTED_EVENT',payload:ev})}
-              />
+              <ClientDetail client={state.selectedClient} onClear={()=>dispatch({type:'SELECT',payload:null})} />
+              <EventFeed events={state.events} filter={state.filter} selected={state.selectedClient} searchQuery={state.searchQuery} onSelectEvent={ev=>dispatch({type:'SET_SELECTED_EVENT',payload:ev})} />
             </div>
           </div>
 
-          <EventModal ev={state.selectedEvent}
-            onClose={()=>dispatch({type:'SET_SELECTED_EVENT',payload:null})}/>
-
-          {state.adminModal&&(
-            <AdminLoginModal onSuccess={handleAdminSuccess} onClose={handleAdminClose}/>
-          )}
+          <EventModal ev={state.selectedEvent} onClose={()=>dispatch({type:'SET_SELECTED_EVENT',payload:null})}/>
+          {state.adminModal&&( <AdminLoginModal onSuccess={handleAdminSuccess} onClose={handleAdminClose}/> )}
         </div>
       );
     }
